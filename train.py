@@ -11,7 +11,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+from txt_logger import create_txt_logger  # 替换TensorBoard
 
 # 添加模块路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src', 'training'))
@@ -32,8 +32,53 @@ class VesselTrainer:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         os.makedirs(args.log_dir, exist_ok=True)
         
-        # 设置日志
-        self.writer = SummaryWriter(args.log_dir)
+        # 创建可视化目录（如果启用增强功能）
+        if args.enable_visualization or args.save_confusion_matrix or args.save_training_curves:
+            os.makedirs(args.visualization_dir, exist_ok=True)
+            print(f"📊 可视化目录: {args.visualization_dir}")
+        
+        # 设置TXT日志记录器
+        self.logger = create_txt_logger(args.log_dir, "cpr_tagnet_training")
+        
+        # 记录配置信息
+        config_dict = {
+            "model": "CPR-TaG-Net",
+            "epochs": args.epochs,
+            "learning_rate": args.learning_rate,
+            "node_batch_size": args.node_batch_size,
+            "weight_decay": args.weight_decay,
+            "max_nodes_per_case": args.max_nodes_per_case,
+            "enable_large_cases": args.enable_large_cases,
+            "device": str(self.device),
+            "enhanced_features": {
+                "graph_completion": getattr(args, 'enable_graph_completion', False),
+                "visualization": getattr(args, 'enable_visualization', False),
+                "confusion_matrix": getattr(args, 'save_confusion_matrix', False),
+                "training_curves": getattr(args, 'save_training_curves', False)
+            }
+        }
+        self.logger.log_config(config_dict)
+        
+        # 初始化增强训练工具
+        self.enhanced_trainer = None
+        if any([args.enable_graph_completion, args.enable_visualization, 
+                args.save_confusion_matrix, args.save_training_curves]):
+            try:
+                from enhanced_training_utils import create_enhanced_trainer
+                self.enhanced_trainer = create_enhanced_trainer(args.visualization_dir)
+                print("🧠 增强训练功能已启用")
+            except ImportError as e:
+                print(f"⚠️ 无法导入增强训练工具: {e}")
+                print("   部分可视化功能可能不可用")
+        
+        # 训练历史记录（用于可视化）
+        self.train_losses = []
+        self.train_accs = []
+        self.val_losses = []
+        self.val_accs = []
+        
+        # 训练开始时间
+        self.start_time = time.time()
         
         # 初始化模型
         self._setup_model()
@@ -230,10 +275,10 @@ class VesselTrainer:
                 total_samples += batch_node_classes.size(0)
                 successful_batches += 1
                 
-                # 记录到tensorboard
-                if batch_idx % 5 == 0:
-                    global_step = epoch * len(self.train_data) * 10 + case_idx * 10 + batch_idx
-                    self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+                # 记录到日志
+                if batch_idx % 10 == 0:  # 每10个batch记录一次
+                    global_step = epoch * 1000 + batch_idx  # 估算全局步数
+                    self.logger.add_scalar('Train/BatchLoss', loss.item(), global_step)
                 
                 # 清理内存
                 del batch_node_features, batch_node_positions, batch_image_cubes, batch_node_classes, outputs
@@ -368,9 +413,9 @@ class VesselTrainer:
         avg_loss = epoch_loss / epoch_samples if epoch_samples > 0 else 0.0
         avg_acc = 100.0 * epoch_correct / epoch_samples if epoch_samples > 0 else 0.0
         
-        # 记录到tensorboard
-        self.writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
-        self.writer.add_scalar('Train/EpochAccuracy', avg_acc, epoch)
+        # 记录到日志
+        self.logger.add_scalar('Train/EpochLoss', avg_loss, epoch)
+        self.logger.add_scalar('Train/EpochAccuracy', avg_acc, epoch)
         
         return avg_loss, avg_acc
     
@@ -505,11 +550,67 @@ class VesselTrainer:
         avg_loss = epoch_loss / epoch_samples if epoch_samples > 0 else 0.0
         avg_acc = 100.0 * epoch_correct / epoch_samples if epoch_samples > 0 else 0.0
         
-        # 记录到tensorboard
-        self.writer.add_scalar('Val/EpochLoss', avg_loss, epoch)
-        self.writer.add_scalar('Val/EpochAccuracy', avg_acc, epoch)
+        # 记录到日志
+        self.logger.add_scalar('Val/EpochLoss', avg_loss, epoch)
+        self.logger.add_scalar('Val/EpochAccuracy', avg_acc, epoch)
         
         return avg_loss, avg_acc
+    
+    def _generate_confusion_matrix(self, epoch):
+        """生成验证集的混淆矩阵"""
+        if not self.val_data or not self.enhanced_trainer:
+            return
+        
+        print("📊 收集验证数据用于混淆矩阵...")
+        all_preds = []
+        all_labels = []
+        
+        self.model.eval()
+        with torch.no_grad():
+            for case_data in self.val_data:
+                try:
+                    # 获取案例数据
+                    node_features = torch.tensor(case_data['node_features'], dtype=torch.float32).to(self.device)
+                    node_positions = torch.tensor(case_data['node_positions'], dtype=torch.float32).to(self.device)
+                    edge_index = torch.tensor(case_data['edge_index'], dtype=torch.long).to(self.device)
+                    image_cubes = torch.tensor(case_data['image_cubes'], dtype=torch.float32).unsqueeze(1).to(self.device)  # [N, 1, 32, 32, 32]
+                    labels = torch.tensor(case_data['node_classes'], dtype=torch.long).to(self.device)
+                    
+                    # 模型预测 - 使用CPR-TaG-Net的完整参数
+                    logits = self.model(node_features, node_positions, edge_index, image_cubes)
+                    
+                    preds = torch.argmax(logits, dim=1)
+                    
+                    # 图形补全（如果启用）
+                    if self.args.enable_graph_completion and node_positions is not None:
+                        try:
+                            refined_preds, _ = self.enhanced_trainer.complete_graph(
+                                node_positions, preds, distance_threshold=5.0
+                            )
+                            preds = refined_preds
+                        except Exception as e:
+                            print(f"   ⚠️ 图形补全失败: {e}")
+                    
+                    all_preds.append(preds.cpu())
+                    all_labels.append(labels.cpu())
+                    
+                except Exception as e:
+                    print(f"   ⚠️ 处理案例 {case_data.get('case_id', 'unknown')} 失败: {e}")
+                    continue
+        
+        if all_preds:
+            # 合并所有预测和标签
+            all_preds = torch.cat(all_preds)
+            all_labels = torch.cat(all_labels)
+            
+            # 生成混淆矩阵
+            self.enhanced_trainer.plot_confusion_matrix(all_labels, all_preds, epoch)
+            
+            # 分析预测质量
+            analysis = self.enhanced_trainer.analyze_prediction_quality(all_labels, all_preds)
+            self.enhanced_trainer.save_analysis_report(analysis, epoch)
+        else:
+            print("   ⚠️ 无法收集到验证数据")
     
     def save_checkpoint(self, epoch, train_loss, val_loss, val_acc, is_best=False):
         """保存检查点"""
@@ -537,35 +638,142 @@ class VesselTrainer:
         """开始训练"""
         print("🚀 Starting CPR-TaG-Net training...")
         
+        # 记录训练开始信息
+        model_info = f"CPR-TaG-Net ({sum(p.numel() for p in self.model.parameters()):,} 参数)"
+        data_info = f"训练集: {len(self.train_data)} 案例, 验证集: {len(self.val_data) if self.val_data else 0} 案例"
+        config_info = f"Epochs: {self.args.epochs}, Learning Rate: {self.args.learning_rate}, Batch Size: {self.args.node_batch_size}"
+        
+        self.logger.log_training_start(model_info, data_info, config_info)
+        
+        # 显示增强功能状态
+        if self.enhanced_trainer:
+            print("🧠 增强功能已启用:")
+            enhanced_features = []
+            if self.args.enable_graph_completion:
+                enhanced_features.append("图形补全")
+                print("  ✅ 图形补全")
+            if self.args.enable_visualization:
+                enhanced_features.append("训练可视化")
+                print("  ✅ 训练可视化")
+            if self.args.save_confusion_matrix:
+                enhanced_features.append("混淆矩阵")
+                print("  ✅ 混淆矩阵")
+            if self.args.save_training_curves:
+                enhanced_features.append("训练曲线")
+                print("  ✅ 训练曲线")
+            
+            self.logger.log_message(f"增强功能已启用: {', '.join(enhanced_features)}")
+        
         best_val_acc = 0.0
+        best_epoch = 0
         
         for epoch in range(self.args.epochs):
+            epoch_start_time = time.time()
+            
             # 训练
             train_loss, train_acc = self.train_epoch(epoch)
             
             # 验证
             val_loss, val_acc = self.validate(epoch)
             
+            # 记录训练历史（用于可视化）
+            self.train_losses.append(train_loss)
+            self.train_accs.append(train_acc)
+            if val_loss is not None:
+                self.val_losses.append(val_loss)
+                self.val_accs.append(val_acc)
+            
             # 更新学习率
+            current_lr = self.optimizer.param_groups[0]['lr']
             self.scheduler.step()
+            new_lr = self.optimizer.param_groups[0]['lr']
+            
+            # 记录学习率变化
+            self.logger.add_scalar('Train/LearningRate', new_lr, epoch)
+            
+            # 计算epoch用时
+            epoch_time = time.time() - epoch_start_time
             
             # 打印结果
             print(f"\n📊 Epoch {epoch+1} Results:")
             print(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%")
             if self.val_data:
                 print(f"  Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.2f}%")
-            print(f"  Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+            print(f"  Learning Rate: {new_lr:.6f}")
+            print(f"  Epoch Time: {epoch_time:.1f}s")
+            
+            # 记录详细的epoch信息到日志
+            extra_info = f"Epoch用时: {epoch_time:.1f}s"
+            if current_lr != new_lr:
+                extra_info += f", 学习率变化: {current_lr:.6f} -> {new_lr:.6f}"
+            
+            self.logger.log_epoch_summary(
+                epoch + 1, train_loss, train_acc, 
+                val_loss if val_loss is not None else 0.0, 
+                val_acc if val_acc is not None else 0.0, 
+                new_lr, extra_info
+            )
+            
+            # 增强功能：生成训练进度可视化
+            if self.enhanced_trainer and self.args.save_training_curves and (epoch + 1) % 5 == 0:
+                try:
+                    self.enhanced_trainer.visualize_training_progress(
+                        self.train_losses, self.train_accs, 
+                        self.val_losses if self.val_losses else None,
+                        self.val_accs if self.val_accs else None,
+                        epoch + 1
+                    )
+                    self.logger.log_message(f"生成训练进度可视化 (Epoch {epoch + 1})")
+                except Exception as e:
+                    print(f"   ⚠️ 训练进度可视化失败: {e}")
+                    self.logger.log_message(f"训练进度可视化失败: {e}", "WARNING")
             
             # 保存检查点
-            is_best = val_acc > best_val_acc
+            is_best = val_acc > best_val_acc if val_acc is not None else False
             if is_best:
                 best_val_acc = val_acc
+                best_epoch = epoch + 1
+                self.logger.log_message(f"新的最佳验证准确率: {best_val_acc:.4f}% (Epoch {best_epoch})")
             
             if epoch % self.args.save_freq == 0 or is_best or epoch == self.args.epochs - 1:
                 self.save_checkpoint(epoch, train_loss, val_loss, val_acc, is_best)
+                
+                # 增强功能：在最佳模型时生成混淆矩阵
+                if is_best and self.enhanced_trainer and self.args.save_confusion_matrix:
+                    try:
+                        print("   📊 生成最佳模型混淆矩阵...")
+                        self.logger.log_message("生成最佳模型混淆矩阵")
+                        self._generate_confusion_matrix(epoch + 1)
+                    except Exception as e:
+                        print(f"   ⚠️ 混淆矩阵生成失败: {e}")
+                        self.logger.log_message(f"混淆矩阵生成失败: {e}", "WARNING")
         
-        print(f"\n🎉 Training completed! Best validation accuracy: {best_val_acc:.2f}%")
-        self.writer.close()
+        # 计算总训练时间
+        total_time = (time.time() - self.start_time) / 60  # 转换为分钟
+        
+        print(f"\n🎉 Training completed! Best validation accuracy: {best_val_acc:.2f}% (Epoch {best_epoch})")
+        print(f"⏱️ Total training time: {total_time:.2f} minutes")
+        
+        # 最终可视化
+        if self.enhanced_trainer:
+            if self.args.save_training_curves:
+                try:
+                    print("📈 生成最终训练曲线...")
+                    self.enhanced_trainer.visualize_training_progress(
+                        self.train_losses, self.train_accs, 
+                        self.val_losses if self.val_losses else None,
+                        self.val_accs if self.val_accs else None
+                    )
+                    self.logger.log_message("生成最终训练曲线")
+                except Exception as e:
+                    print(f"⚠️ 最终训练曲线生成失败: {e}")
+                    self.logger.log_message(f"最终训练曲线生成失败: {e}", "WARNING")
+        
+        # 记录训练结束
+        self.logger.log_training_end(best_epoch, best_val_acc, total_time)
+        self.logger.close()
+        
+        print(f"📝 详细日志已保存到: {self.logger.get_experiment_dir()}")
 
 def main():
     parser = argparse.ArgumentParser(description='CPR-TaG-Net血管分类模型训练')
@@ -597,6 +805,18 @@ def main():
                        help='日志保存目录')
     parser.add_argument('--save_freq', type=int, default=5, help='检查点保存频率')
     
+    # 增强功能参数
+    parser.add_argument('--enable_graph_completion', action='store_true',
+                       help='启用图形补全功能')
+    parser.add_argument('--enable_visualization', action='store_true',
+                       help='启用训练可视化功能')
+    parser.add_argument('--save_confusion_matrix', action='store_true',
+                       help='保存混淆矩阵')
+    parser.add_argument('--save_training_curves', action='store_true',
+                       help='保存训练曲线')
+    parser.add_argument('--visualization_dir', type=str, default='/home/lihe/classify/lungmap/outputs/visualizations',
+                       help='可视化结果保存目录')
+    
     args = parser.parse_args()
     
     # 打印配置
@@ -611,6 +831,23 @@ def main():
     print(f"  Node batch size: {args.node_batch_size}")
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    
+    # 增强功能配置
+    enhanced_features = []
+    if args.enable_graph_completion:
+        enhanced_features.append("图形补全")
+    if args.enable_visualization:
+        enhanced_features.append("训练可视化")
+    if args.save_confusion_matrix:
+        enhanced_features.append("混淆矩阵")
+    if args.save_training_curves:
+        enhanced_features.append("训练曲线")
+    
+    if enhanced_features:
+        print(f"  🧠 增强功能: {', '.join(enhanced_features)}")
+        print(f"  📊 可视化目录: {args.visualization_dir}")
+    else:
+        print(f"  基础训练模式（无增强功能）")
     
     # GPU显存检查
     if torch.cuda.is_available():

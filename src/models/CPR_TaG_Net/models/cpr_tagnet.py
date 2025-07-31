@@ -42,72 +42,91 @@ class CPRTaGNet(nn.Module):
         edge_index: 图连接 [2, E]
         image_cubes: 对应节点图像块 [N, C, D, H, W]
         """
+        # 输入验证
+        self._validate_inputs(x_node, pos, edge_index, image_cubes)
+        
+        batch_size = x_node.shape[0]
+        
+        # ===== 图像条件路径 =====
         try:
-            batch_size = x_node.shape[0]
-            
-            # ===== 图像条件路径 =====
             image_feat = self.image_encoder(image_cubes)  # [N, 64]
             image_cond = self.image_proj(image_feat)  # [N, 256]
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            raise RuntimeError(f"图像特征提取失败: {e}") from e
 
-            # ===== 图结构路径：Encoder（SA） =====
+        # ===== 图结构路径：Encoder（SA） ===== 
+        try:
             sa1_feat, sa1_pos, sa1_edge = self.sa1(x_node, pos, edge_index)  # [M1, 128]
             sa2_feat, sa2_pos, sa2_edge = self.sa2(sa1_feat, sa1_pos, sa1_edge)  # [M2, 256]
+        except (RuntimeError, IndexError, ValueError) as e:
+            if "tensor" in str(e).lower() and "dimension" in str(e).lower():
+                raise ValueError(f"SA模块tensor维度错误: {e}") from e
+            elif "index" in str(e).lower():
+                raise IndexError(f"SA模块索引错误: {e}") from e
+            else:
+                raise RuntimeError(f"SA模块处理失败: {e}") from e
 
-            # ===== 图结构路径：Decoder（FP） =====
+        # ===== 图结构路径：Decoder（FP） =====
+        try:
             fp1_feat = self.fp1(sa2_feat, sa2_pos, sa1_pos, sa1_feat)  # [M1, 128]
             fp2_feat = self.fp2(fp1_feat, sa1_pos, pos, x_node)        # [N, 64]
+        except (RuntimeError, ValueError) as e:
+            if "shape" in str(e).lower() or "dimension" in str(e).lower():
+                raise ValueError(f"FP模块维度不匹配: {e}") from e
+            else:
+                raise RuntimeError(f"FP模块处理失败: {e}") from e
 
-            # ===== 🔧 修复：确保维度匹配 =====
-            # 检查fp2_feat和image_cond的维度是否匹配
-            if fp2_feat.shape[0] != image_cond.shape[0]:
-                print(f"⚠️  Dimension mismatch: fp2_feat {fp2_feat.shape}, image_cond {image_cond.shape}")
-                # 如果维度不匹配，使用插值调整
-                if fp2_feat.shape[0] < image_cond.shape[0]:
-                    # 从image_cond中选择对应的特征
-                    image_cond = image_cond[:fp2_feat.shape[0]]
-                else:
-                    # 对fp2_feat进行下采样或重复
-                    fp2_feat = fp2_feat[:image_cond.shape[0]]
+        # ===== 特征维度对齐 =====
+        fp2_feat, image_cond = self._align_feature_dimensions(fp2_feat, image_cond)
 
-            # ===== 多任务输出（融合图结构 + 图像条件） =====
-            # 🔧 修复：动态处理特征维度不匹配
-            expected_graph_dim = 64  # 期望的图特征维度
-            expected_image_dim = 256  # 期望的图像特征维度
-            
-            # 调整图特征维度
-            if fp2_feat.shape[1] != expected_graph_dim:
-                if not hasattr(self, '_graph_proj') or self._graph_proj.in_features != fp2_feat.shape[1]:
-                    self._graph_proj = nn.Linear(fp2_feat.shape[1], expected_graph_dim).to(fp2_feat.device)
-                fp2_feat = self._graph_proj(fp2_feat)
-            
-            # 调整图像特征维度
-            if image_cond.shape[1] != expected_image_dim:
-                if not hasattr(self, '_image_proj_fix') or self._image_proj_fix.in_features != image_cond.shape[1]:
-                    self._image_proj_fix = nn.Linear(image_cond.shape[1], expected_image_dim).to(image_cond.device)
-                image_cond = self._image_proj_fix(image_cond)
-            
+        # ===== 特征融合与分类 =====
+        try:
             out_feat = torch.cat([fp2_feat, image_cond], dim=1)  # [N, 320]
-            
-            # 🔧 修复：动态处理分类器输入维度
-            expected_classifier_dim = 320  # 64 + 256
-            if out_feat.shape[1] != expected_classifier_dim:
-                if not hasattr(self, '_classifier_proj') or self._classifier_proj.in_features != out_feat.shape[1]:
-                    self._classifier_proj = nn.Linear(out_feat.shape[1], expected_classifier_dim).to(out_feat.device)
-                out_feat = self._classifier_proj(out_feat)
-            
             logits = self.classifier(out_feat)  # [N, num_classes]
-
             return logits
-            
-        except Exception as e:
-            print(f"⚠️  CPRTaGNet forward error: {e}")
-            # 降级处理：仅使用图像特征
-            batch_size = x_node.shape[0]
-            image_feat = self.image_encoder(image_cubes)  # [N, 64]
-            image_cond = self.image_proj(image_feat)  # [N, 256]
-            
-            # 创建零图结构特征
-            graph_feat = torch.zeros((batch_size, 64), device=x_node.device)
-            out_feat = torch.cat([graph_feat, image_cond], dim=1)
-            logits = self.classifier(out_feat)
-            return logits
+        except (RuntimeError, ValueError) as e:
+            if "cat" in str(e).lower():
+                raise ValueError(f"特征拼接失败，维度不匹配: fp2_feat {fp2_feat.shape}, image_cond {image_cond.shape}") from e
+            else:
+                raise RuntimeError(f"分类器处理失败: {e}") from e
+    
+    def _validate_inputs(self, x_node, pos, edge_index, image_cubes):
+        """输入数据验证"""
+        if x_node.dim() != 2 or x_node.shape[1] != self.node_feature_dim:
+            raise ValueError(f"x_node维度错误: 期望 [N, {self.node_feature_dim}], 实际 {x_node.shape}")
+        
+        if pos.dim() != 2 or pos.shape[1] != 3:
+            raise ValueError(f"pos维度错误: 期望 [N, 3], 实际 {pos.shape}")
+        
+        if x_node.shape[0] != pos.shape[0]:
+            raise ValueError(f"节点数量不匹配: x_node {x_node.shape[0]}, pos {pos.shape[0]}")
+        
+        if edge_index.dim() != 2 or edge_index.shape[0] != 2:
+            raise ValueError(f"edge_index维度错误: 期望 [2, E], 实际 {edge_index.shape}")
+        
+        if image_cubes.dim() != 5:
+            raise ValueError(f"image_cubes维度错误: 期望 [N, C, D, H, W], 实际 {image_cubes.shape}")
+        
+        if image_cubes.shape[0] != x_node.shape[0]:
+            raise ValueError(f"图像块数量不匹配: image_cubes {image_cubes.shape[0]}, x_node {x_node.shape[0]}")
+    
+    def _align_feature_dimensions(self, fp2_feat, image_cond):
+        """特征维度对齐处理"""
+        # 检查节点数量维度匹配
+        if fp2_feat.shape[0] != image_cond.shape[0]:
+            min_nodes = min(fp2_feat.shape[0], image_cond.shape[0])
+            print(f"⚠️  节点数量不匹配，对齐到 {min_nodes}: fp2_feat {fp2_feat.shape[0]} -> {min_nodes}, image_cond {image_cond.shape[0]} -> {min_nodes}")
+            fp2_feat = fp2_feat[:min_nodes]
+            image_cond = image_cond[:min_nodes]
+        
+        # 检查特征维度
+        expected_graph_dim = 64
+        expected_image_dim = 256
+        
+        if fp2_feat.shape[1] != expected_graph_dim:
+            raise ValueError(f"图特征维度错误: 期望 {expected_graph_dim}, 实际 {fp2_feat.shape[1]}")
+        
+        if image_cond.shape[1] != expected_image_dim:
+            raise ValueError(f"图像特征维度错误: 期望 {expected_image_dim}, 实际 {image_cond.shape[1]}")
+        
+        return fp2_feat, image_cond

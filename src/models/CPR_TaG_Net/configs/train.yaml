@@ -1,23 +1,40 @@
 
-# === CPR-TaG-Net 训练配置文件 ===
+# === CPR-TaG-Net 统一训练配置文件 ===
 
 model:
   name: CPRTaGNet
+  num_classes: 18
   image_condition_channels: 1
   node_feature_dim: 54
   tps_sample_num: 64
   tfg_radius: 10.0
 
 training:
-  epochs: 100
-  batch_size: 4
+  # 24GB显存优化配置
+  epochs: 25
+  batch_size: 1  # 图数据batch_size固定为1
+  node_batch_size: 300  # 节点级批处理大小
+  max_nodes_per_case: 6000  # 最大节点数限制
+  enable_large_cases: true
+  
+  # 优化器参数
   lr: 0.0005
-  weight_decay: 1e-5
+  weight_decay: 5e-5
+  
+  # 学习率调度
+  step_size: 15
+  gamma: 0.7
+  
+  # 多任务学习
   alpha: 0.5  # label loss vs segmentation loss
 
 dataset:
-  train_data_path: ./data/train_data.pkl
-  val_data_path: ./data/val_data.pkl
+  # 使用实际的数据路径
+  data_dir: "./data/processed"
+  file_pattern: "*.npz"
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
   num_workers: 4
 
 loss:
@@ -25,6 +42,32 @@ loss:
   seg: BCEWithLogits
 
 log:
-  save_dir: ./checkpoints/
-  log_dir: ./logs/
+  save_dir: "./outputs/checkpoints/"
+  log_dir: "./outputs/logs/"
   save_interval: 10
+
+# GPU配置
+gpu:
+  device_id: 2  # 使用GPU 2
+  memory_limit: 24  # 24GB显存
+
+# 血管分类标签
+vessel_classes:
+  - "MPA"      # 0: 主肺动脉
+  - "LPA"      # 1: 左肺动脉  
+  - "RPA"      # 2: 右肺动脉
+  - "Linternal" # 3: 左肺动脉内侧段
+  - "Lupper"   # 4: 左上叶动脉
+  - "Lmedium"  # 5: 左中叶动脉
+  - "Ldown"    # 6: 左下叶动脉
+  - "L1+2"     # 7: 左上叶前段+后段
+  - "L1+3"     # 8: 左上叶前段+尖段
+  - "Rinternal" # 9: 右肺动脉内侧段
+  - "Rupper"   # 10: 右上叶动脉
+  - "Rmedium"  # 11: 右中叶动脉
+  - "RDown"    # 12: 右下叶动脉
+  - "R1+2"     # 13: 右上叶前段+后段
+  - "R1+3"     # 14: 右上叶前段+尖段
+  - "R4"       # 15: 右中叶外侧段
+  - "R5"       # 16: 右中叶内侧段
+  - "other"    # 17: 其他

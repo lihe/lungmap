@@ -6,7 +6,8 @@ from skimage.morphology import skeletonize_3d
 from sklearn.neighbors import NearestNeighbors
 from typing import Dict, List, Tuple, Optional
 import networkx as nx
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import pdist, squareform, cdist
+from collections import defaultdict
 
 class VesselPreprocessor:
     """血管预处理器：从分割标签到图构建的完整pipeline"""
@@ -518,7 +519,7 @@ class VesselPreprocessor:
         return features
     
     def _build_vessel_graph(self, centerlines: Dict, ct_array: np.ndarray, ct_image) -> Dict:
-        """构建血管图"""
+        """构建血管图（集成图形补全）"""
         all_nodes = []
         all_edges = []
         node_features = []
@@ -553,7 +554,7 @@ class VesselPreprocessor:
             for i in range(start_node_id, end_node_id):
                 all_edges.append([i, i + 1])
         
-        # 添加血管间的连接（基于解剖学先验知识）
+        # 添加血管间的基础连接（基于解剖学先验知识）
         vessel_connections = self._get_anatomical_connections()
         
         for vessel1, vessel2 in vessel_connections:
@@ -576,7 +577,8 @@ class VesselPreprocessor:
         else:
             edge_index = np.array([[], []])
         
-        return {
+        # 构建初始图结构
+        vessel_graph = {
             'nodes': all_nodes,
             'node_features': node_features,
             'node_positions': node_positions,
@@ -585,6 +587,11 @@ class VesselPreprocessor:
             'vessel_node_ranges': vessel_node_ranges,
             'node_to_vessel': node_to_vessel
         }
+        
+        # 🧠 执行图形补全
+        vessel_graph = self._complete_vessel_graph(vessel_graph)
+        
+        return vessel_graph
     
     def _get_anatomical_connections(self) -> List[Tuple[str, str]]:
         """获取解剖学连接关系"""
@@ -610,6 +617,347 @@ class VesselPreprocessor:
             ('Rupper', 'R1+3'),
         ]
         return connections
+    
+    def _complete_vessel_graph(self, vessel_graph: Dict) -> Dict:
+        """
+        🧠 图形补全：优化血管图的连接性和拓扑结构
+        """
+        print("🔧 执行图形补全...")
+        
+        node_positions = vessel_graph['node_positions']
+        edge_index = vessel_graph['edge_index']
+        node_classes = vessel_graph['node_classes']
+        vessel_node_ranges = vessel_graph['vessel_node_ranges']
+        
+        # 1. 基于距离的连接补全
+        enhanced_edges = self._distance_based_completion(
+            node_positions, edge_index, node_classes, distance_threshold=5.0
+        )
+        
+        # 2. 基于解剖学的连接补全
+        anatomical_edges = self._anatomical_based_completion(
+            vessel_node_ranges, node_positions, node_classes
+        )
+        
+        # 3. 基于连续性的连接补全
+        continuity_edges = self._continuity_based_completion(
+            node_positions, edge_index, node_classes
+        )
+        
+        # 4. 合并所有边连接
+        all_edges = self._merge_edge_connections(
+            [edge_index, enhanced_edges, anatomical_edges, continuity_edges]
+        )
+        
+        # 5. 移除重复和冲突的边
+        final_edges = self._clean_edge_connections(all_edges, node_positions, node_classes)
+        
+        # 更新图结构
+        vessel_graph['edge_index'] = final_edges
+        vessel_graph['completion_stats'] = self._compute_completion_stats(
+            edge_index, final_edges
+        )
+        
+        print(f"   原始边数: {edge_index.shape[1] if edge_index.size > 0 else 0}")
+        print(f"   补全后边数: {final_edges.shape[1] if final_edges.size > 0 else 0}")
+        print(f"   新增边数: {final_edges.shape[1] - edge_index.shape[1] if edge_index.size > 0 and final_edges.size > 0 else 0}")
+        
+        return vessel_graph
+
+    def _distance_based_completion(self, positions: np.ndarray, existing_edges: np.ndarray, 
+                                  classes: np.ndarray, distance_threshold: float = 5.0) -> np.ndarray:
+        """基于距离的连接补全"""
+        new_edges = []
+        n_nodes = len(positions)
+        
+        # 计算所有节点间的距离
+        distances = cdist(positions, positions)
+        
+        # 获取现有连接
+        existing_connections = set()
+        if existing_edges.size > 0:
+            for i in range(existing_edges.shape[1]):
+                src, tgt = existing_edges[0, i], existing_edges[1, i]
+                existing_connections.add((min(src, tgt), max(src, tgt)))
+        
+        # 找到相近但未连接的节点对
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                if (i, j) not in existing_connections:
+                    if distances[i, j] < distance_threshold:
+                        # 检查是否应该连接（基于血管类别）
+                        if self._should_connect_by_distance(classes[i], classes[j], distances[i, j]):
+                            new_edges.append([i, j])
+        
+        if len(new_edges) == 0:
+            return np.array([[], []])
+        
+        return np.array(new_edges).T
+
+    def _should_connect_by_distance(self, class1: int, class2: int, distance: float) -> bool:
+        """判断两个节点是否应该基于距离连接"""
+        # 同类别节点，距离很近
+        if class1 == class2 and distance < 3.0:
+            return True
+        
+        # 相邻层级的血管类别
+        anatomical_adjacency = {
+            0: [1, 2],        # MPA -> LPA, RPA
+            1: [3, 4],        # LPA -> Linternal, Lupper  
+            2: [5, 6],        # RPA -> Rinternal, Rupper
+            3: [7, 8],        # Linternal -> Lmedium, Ldown
+            4: [9, 10],       # Lupper -> L1+2, L1+3
+            5: [11, 12],      # Rinternal -> Rmedium, RDown
+            6: [13, 14],      # Rupper -> R1+2, R1+3
+        }
+        
+        # 检查解剖学邻接关系
+        if class2 in anatomical_adjacency.get(class1, []) or class1 in anatomical_adjacency.get(class2, []):
+            return distance < 8.0
+        
+        return False
+
+    def _anatomical_based_completion(self, vessel_ranges: Dict, positions: np.ndarray, 
+                                    classes: np.ndarray) -> np.ndarray:
+        """基于解剖学先验知识的连接补全"""
+        new_edges = []
+        
+        # 定义解剖学连接规则
+        anatomical_connections = [
+            ('MPA', 'LPA'), ('MPA', 'RPA'),
+            ('LPA', 'Linternal'), ('LPA', 'Lupper'),
+            ('RPA', 'Rinternal'), ('RPA', 'Rupper'),
+            ('Linternal', 'Lmedium'), ('Linternal', 'Ldown'),
+            ('Lupper', 'L1+2'), ('Lupper', 'L1+3'),
+            ('Rinternal', 'Rmedium'), ('Rinternal', 'RDown'),
+            ('Rupper', 'R1+2'), ('Rupper', 'R1+3'),
+        ]
+        
+        # 为每个解剖学连接找到最佳节点对
+        for vessel1, vessel2 in anatomical_connections:
+            if vessel1 in vessel_ranges and vessel2 in vessel_ranges:
+                range1 = vessel_ranges[vessel1]
+                range2 = vessel_ranges[vessel2]
+                
+                # 找到两个血管间距离最近的节点对
+                best_connection = self._find_best_vessel_connection(
+                    range1, range2, positions, classes
+                )
+                
+                if best_connection:
+                    new_edges.append(best_connection)
+        
+        if len(new_edges) == 0:
+            return np.array([[], []])
+        
+        return np.array(new_edges).T
+
+    def _find_best_vessel_connection(self, range1: Tuple[int, int], range2: Tuple[int, int],
+                                    positions: np.ndarray, classes: np.ndarray) -> Optional[List[int]]:
+        """找到两个血管间的最佳连接"""
+        start1, end1 = range1
+        start2, end2 = range2
+        
+        best_distance = float('inf')
+        best_connection = None
+        
+        # 检查血管端点间的连接
+        candidates = [
+            (start1, start2),  # 起点-起点
+            (start1, end2),    # 起点-终点
+            (end1, start2),    # 终点-起点
+            (end1, end2),      # 终点-终点
+        ]
+        
+        for node1, node2 in candidates:
+            if node1 < len(positions) and node2 < len(positions):
+                distance = np.linalg.norm(positions[node1] - positions[node2])
+                
+                # 距离阈值：解剖学连接应该相对较近
+                if distance < 15.0 and distance < best_distance:
+                    best_distance = distance
+                    best_connection = [node1, node2]
+        
+        return best_connection
+
+    def _continuity_based_completion(self, positions: np.ndarray, existing_edges: np.ndarray,
+                                    classes: np.ndarray) -> np.ndarray:
+        """基于血管连续性的连接补全"""
+        new_edges = []
+        
+        if existing_edges.size == 0:
+            return np.array([[], []])
+        
+        # 构建现有图的邻接表
+        adjacency = defaultdict(list)
+        
+        for i in range(existing_edges.shape[1]):
+            src, tgt = existing_edges[0, i], existing_edges[1, i]
+            adjacency[src].append(tgt)
+            adjacency[tgt].append(src)
+        
+        # 找到孤立节点和度为1的节点（端点）
+        isolated_nodes = []
+        endpoint_nodes = []
+        
+        for node in range(len(positions)):
+            degree = len(adjacency[node])
+            if degree == 0:
+                isolated_nodes.append(node)
+            elif degree == 1:
+                endpoint_nodes.append(node)
+        
+        # 为孤立节点找连接
+        for isolated in isolated_nodes:
+            best_neighbor = self._find_best_neighbor_for_isolated(
+                isolated, positions, classes, adjacency
+            )
+            if best_neighbor is not None:
+                new_edges.append([isolated, best_neighbor])
+        
+        # 连接相近的端点
+        for i, endpoint1 in enumerate(endpoint_nodes):
+            for endpoint2 in endpoint_nodes[i+1:]:
+                if self._should_connect_endpoints(
+                    endpoint1, endpoint2, positions, classes, adjacency
+                ):
+                    new_edges.append([endpoint1, endpoint2])
+        
+        if len(new_edges) == 0:
+            return np.array([[], []])
+        
+        return np.array(new_edges).T
+
+    def _find_best_neighbor_for_isolated(self, isolated_node: int, positions: np.ndarray,
+                                       classes: np.ndarray, adjacency: Dict) -> Optional[int]:
+        """为孤立节点找到最佳邻居"""
+        isolated_pos = positions[isolated_node]
+        isolated_class = classes[isolated_node]
+        
+        best_neighbor = None
+        best_distance = float('inf')
+        
+        for candidate in range(len(positions)):
+            if candidate == isolated_node:
+                continue
+            
+            # 优先连接同类别节点
+            if classes[candidate] == isolated_class:
+                distance = np.linalg.norm(positions[candidate] - isolated_pos)
+                if distance < 10.0 and distance < best_distance:
+                    best_distance = distance
+                    best_neighbor = candidate
+        
+        # 如果没找到同类别的，找相邻类别的
+        if best_neighbor is None:
+            for candidate in range(len(positions)):
+                if candidate == isolated_node:
+                    continue
+                
+                if self._should_connect_by_distance(isolated_class, classes[candidate], 0):
+                    distance = np.linalg.norm(positions[candidate] - isolated_pos)
+                    if distance < 8.0 and distance < best_distance:
+                        best_distance = distance
+                        best_neighbor = candidate
+        
+        return best_neighbor
+
+    def _should_connect_endpoints(self, endpoint1: int, endpoint2: int, positions: np.ndarray,
+                                 classes: np.ndarray, adjacency: Dict) -> bool:
+        """判断两个端点是否应该连接"""
+        distance = np.linalg.norm(positions[endpoint1] - positions[endpoint2])
+        
+        # 距离太远，不连接
+        if distance > 10.0:
+            return False
+        
+        # 同类别的端点，较近时可以连接
+        if classes[endpoint1] == classes[endpoint2] and distance < 5.0:
+            return True
+        
+        # 不同类别但解剖学相关的端点
+        if self._should_connect_by_distance(classes[endpoint1], classes[endpoint2], distance):
+            return distance < 7.0
+        
+        return False
+
+    def _merge_edge_connections(self, edge_lists: List[np.ndarray]) -> np.ndarray:
+        """合并多个边连接列表"""
+        all_edges = []
+        
+        for edges in edge_lists:
+            if edges.size > 0 and edges.shape[0] == 2:
+                for i in range(edges.shape[1]):
+                    all_edges.append([edges[0, i], edges[1, i]])
+        
+        if len(all_edges) == 0:
+            return np.array([[], []])
+        
+        return np.array(all_edges).T
+
+    def _clean_edge_connections(self, edges: np.ndarray, positions: np.ndarray, 
+                               classes: np.ndarray) -> np.ndarray:
+        """清理边连接：移除重复、自环和冲突的边"""
+        if edges.size == 0:
+            return edges
+        
+        cleaned_edges = []
+        seen_edges = set()
+        
+        for i in range(edges.shape[1]):
+            src, tgt = edges[0, i], edges[1, i]
+            
+            # 移除自环
+            if src == tgt:
+                continue
+            
+            # 移除重复边（无向图）
+            edge_key = (min(src, tgt), max(src, tgt))
+            if edge_key in seen_edges:
+                continue
+            
+            # 检查边的合理性
+            if self._is_valid_edge(src, tgt, positions, classes):
+                cleaned_edges.append([src, tgt])
+                seen_edges.add(edge_key)
+        
+        if len(cleaned_edges) == 0:
+            return np.array([[], []])
+        
+        return np.array(cleaned_edges).T
+
+    def _is_valid_edge(self, src: int, tgt: int, positions: np.ndarray, classes: np.ndarray) -> bool:
+        """检查边的有效性"""
+        # 检查节点索引
+        if src >= len(positions) or tgt >= len(positions):
+            return False
+        
+        # 检查距离：过远的连接不合理
+        distance = np.linalg.norm(positions[src] - positions[tgt])
+        if distance > 20.0:  # 最大连接距离
+            return False
+        
+        # 检查类别兼容性
+        if not self._should_connect_by_distance(classes[src], classes[tgt], distance):
+            return False
+        
+        return True
+
+    def _compute_completion_stats(self, original_edges: np.ndarray, final_edges: np.ndarray) -> Dict:
+        """计算图形补全统计信息"""
+        stats = {
+            'original_edge_count': original_edges.shape[1] if original_edges.size > 0 else 0,
+            'final_edge_count': final_edges.shape[1] if final_edges.size > 0 else 0,
+            'added_edge_count': 0,
+            'completion_ratio': 0.0
+        }
+        
+        if original_edges.size > 0 and final_edges.size > 0:
+            stats['added_edge_count'] = stats['final_edge_count'] - stats['original_edge_count']
+            if stats['original_edge_count'] > 0:
+                stats['completion_ratio'] = stats['added_edge_count'] / stats['original_edge_count']
+        
+        return stats
     
     def _sample_image_cubes(self, nodes: List, ct_array: np.ndarray) -> np.ndarray:
         """为每个节点采样图像块"""
@@ -680,6 +1028,15 @@ class VesselPreprocessor:
         print(f"  - Nodes: {len(vessel_graph['nodes'])}")
         print(f"  - Edges: {vessel_graph['edge_index'].shape[1] if vessel_graph['edge_index'].size > 0 else 0}")
         print(f"  - Vessels: {len(vessel_graph['vessel_node_ranges'])}")
+        
+        # 显示图形补全统计
+        if 'completion_stats' in vessel_graph:
+            stats = vessel_graph['completion_stats']
+            print(f"  - 图形补全统计:")
+            print(f"    原始边数: {stats['original_edge_count']}")
+            print(f"    补全后边数: {stats['final_edge_count']}")
+            print(f"    新增边数: {stats['added_edge_count']}")
+            print(f"    补全率: {stats['completion_ratio']:.2%}")
         
         return training_data
     

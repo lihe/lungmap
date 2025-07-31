@@ -1,3 +1,49 @@
 {
-  "connections": [["LAD", "D"], ["RCA", "PDA"]]
+  "pulmonary_vessels": {
+    "main_branches": ["MPA", "LPA", "RPA"],
+    "anatomical_connections": [
+      ["MPA", "LPA"],
+      ["MPA", "RPA"],
+      ["LPA", "Linternal"],
+      ["LPA", "Lupper"],
+      ["Linternal", "Lmedium"],
+      ["Linternal", "Ldown"],
+      ["Lupper", "L1+2"],
+      ["Lupper", "L1+3"],
+      ["RPA", "Rinternal"],
+      ["RPA", "Rupper"],
+      ["Rinternal", "Rmedium"],
+      ["Rinternal", "RDown"],
+      ["Rupper", "R1+2"],
+      ["Rupper", "R1+3"],
+      ["Rmedium", "R4"],
+      ["Rmedium", "R5"]
+    ],
+    "vessel_hierarchy": {
+      "MPA": 0,
+      "LPA": 1,
+      "RPA": 1,
+      "Linternal": 2,
+      "Lupper": 2,
+      "Rinternal": 2,
+      "Rupper": 2,
+      "Lmedium": 3,
+      "Ldown": 3,
+      "Rmedium": 3,
+      "RDown": 3,
+      "L1+2": 3,
+      "L1+3": 3,
+      "R1+2": 3,
+      "R1+3": 3,
+      "R4": 4,
+      "R5": 4,
+      "other": 5
+    },
+    "class_mapping": {
+      "MPA": 0, "LPA": 1, "RPA": 2, "Linternal": 3, "Lupper": 4,
+      "Lmedium": 5, "Ldown": 6, "L1+2": 7, "L1+3": 8, "Rinternal": 9,
+      "Rupper": 10, "Rmedium": 11, "RDown": 12, "R1+2": 13, "R1+3": 14,
+      "R4": 15, "R5": 16, "other": 17
+    }
+  }
 }

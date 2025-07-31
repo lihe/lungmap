@@ -158,21 +158,24 @@ def plot_confusion_matrix(y_true, y_pred, class_names):
 
 def main():
     # ==== 1. 加载配置 ====
-    config = load_config('configs/train.yaml')
+    import sys
+    sys.path.append('../../../')  # 添加项目根目录到路径
+    from config_manager import get_config_manager
+    
+    config_mgr = get_config_manager()
+    config = config_mgr.train_config
+    config_mgr.print_config_summary()
+    
     os.makedirs(config['log']['save_dir'], exist_ok=True)
 
     # ==== 2. 加载数据 ====
     print("=== 加载数据 ===")
     
-    # 检查数据文件是否存在
-    if not os.path.exists(config['dataset']['train_data_path']):
-        print(f"❌ 训练数据文件不存在: {config['dataset']['train_data_path']}")
-        print("请先运行数据预处理脚本: python data/batch_preprocess.py")
-        return
-    
-    if not os.path.exists(config['dataset']['val_data_path']):
-        print(f"❌ 验证数据文件不存在: {config['dataset']['val_data_path']}")
-        print("请先运行数据预处理脚本: python data/batch_preprocess.py")
+    # 使用新的数据路径配置
+    data_dir = config['dataset']['data_dir']
+    if not os.path.exists(data_dir):
+        print(f"❌ 数据目录不存在: {data_dir}")
+        print("请确保数据已经预处理并放置在正确目录")
         return
     
     with open(config['dataset']['train_data_path'], 'rb') as f:

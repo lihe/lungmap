@@ -217,17 +217,16 @@ class VesselTrainer:
                     'Acc': f'{current_acc:.4f}'
                 })
                 
-                # 记录到tensorboard
-                global_step = epoch * len(self.train_loader) + batch_idx
-                self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
-                self.writer.add_scalar('Train/BatchAcc', current_acc, global_step)
-                
             except Exception as e:
                 print(f"❌ Error in batch {batch_idx}: {e}")
                 continue
         
         avg_loss = total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
         avg_acc = correct_predictions / total_predictions if total_predictions > 0 else 0
+        
+        # 记录epoch级别的训练指标
+        self.writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
+        self.writer.add_scalar('Train/EpochAcc', avg_acc, epoch)
         
         return avg_loss, avg_acc
     
@@ -273,6 +272,10 @@ class VesselTrainer:
         
         avg_loss = total_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
         avg_acc = correct_predictions / total_predictions if total_predictions > 0 else 0
+        
+        # 记录epoch级别的验证指标
+        self.writer.add_scalar('Val/EpochLoss', avg_loss, epoch)
+        self.writer.add_scalar('Val/EpochAcc', avg_acc, epoch)
         
         return avg_loss, avg_acc
     
@@ -338,11 +341,7 @@ class VesselTrainer:
             # 调度器步进
             self.scheduler.step()
             
-            # 记录到tensorboard
-            self.writer.add_scalar('Epoch/TrainLoss', train_loss, epoch)
-            self.writer.add_scalar('Epoch/TrainAcc', train_acc, epoch)
-            self.writer.add_scalar('Epoch/ValLoss', val_loss, epoch)
-            self.writer.add_scalar('Epoch/ValAcc', val_acc, epoch)
+            # 只记录学习率，其他指标已在各自函数中记录
             self.writer.add_scalar('Epoch/LR', self.scheduler.get_last_lr()[0], epoch)
             
             # 打印结果

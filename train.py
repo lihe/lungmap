@@ -10,6 +10,7 @@ import time
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from txt_logger import create_txt_logger  # 替换TensorBoard
 
@@ -59,6 +60,38 @@ class VesselTrainer:
         }
         self.logger.log_config(config_dict)
         
+        # 🔧 血管感知训练改进：添加正确的血管层次信息（包括变异情况）
+        self.vessel_hierarchy = {
+            # 一级：主肺动脉
+            'MPA': {'level': 0, 'parent': None, 'expected_class_range': [0, 1, 2, 3]},
+            
+            # 二级：左右肺动脉
+            'LPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1, 2, 3]},
+            'RPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1, 2, 3]},
+            
+            # 三级：上叶、段间、内侧、中叶、下叶分支（包括变异）
+            'Lupper': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},
+            'Rupper': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},
+            'L1+2': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},      # 左上叶变异
+            'R1+2': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},      # 右上叶变异
+            'L1+3': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},      # 左上叶变异
+            'R1+3': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},      # 右上叶变异
+            'Linternal': {'level': 2, 'parent': 'LPA', 'expected_class_range': [8, 9, 10, 11]},
+            'Rinternal': {'level': 2, 'parent': 'RPA', 'expected_class_range': [8, 9, 10, 11]},
+            'Lmedium': {'level': 2, 'parent': 'LPA', 'expected_class_range': [12]},         # 左中叶（变异）
+            'Rmedium': {'level': 2, 'parent': 'RPA', 'expected_class_range': [12]},         # 右中叶
+            'Ldown': {'level': 2, 'parent': 'LPA', 'expected_class_range': [13, 14]},
+            'RDown': {'level': 2, 'parent': 'RPA', 'expected_class_range': [13, 14]}
+        }
+        
+        # 血管类型嵌入（更新维度以适应更多血管类型）
+        self.vessel_type_embedding = nn.Embedding(len(self.vessel_hierarchy) + 1, 32).to(self.device)  # +1 for unknown vessels
+        
+        # 🔧 血管感知训练权重配置
+        self.vessel_consistency_weight = getattr(args, 'vessel_consistency_weight', 0.1)
+        self.spatial_consistency_weight = getattr(args, 'spatial_consistency_weight', 0.05)
+        self.enable_vessel_aware = getattr(args, 'enable_vessel_aware', True)
+        
         # 初始化增强训练工具
         self.enhanced_trainer = None
         if any([args.enable_graph_completion, args.enable_visualization, 
@@ -93,15 +126,21 @@ class VesselTrainer:
         """初始化CPR-TaG-Net模型"""
         print("🔧 Setting up CPR-TaG-Net model...")
         
+        # 🔧 计算增强后的特征维度
+        # 原始特征(54) + 血管类型嵌入(32) + 层次编码(3) + 血管内位置(1) = 90
+        enhanced_feature_dim = 54 + 32 + 3 + 1
+        
         # CPR-TaG-Net 配置参数
         model_config = {
-            'num_classes': 15,  # 根据您的数据，有15个类别（0-14）
-            'node_feature_dim': 54,  # 节点特征维度
+            'num_classes': 15,  # 实际数据中有0-14共15个类别（包括背景类0）
+            'node_feature_dim': enhanced_feature_dim,  # 增强后的节点特征维度
             'image_channels': 1,  # 图像通道数
         }
         
         self.model = CPRTaGNet(**model_config).to(self.device)
-        print(f"✅ CPR-TaG-Net initialized with {sum(p.numel() for p in self.model.parameters()):,} parameters")
+        print(f"✅ CPR-TaG-Net initialized with enhanced features ({enhanced_feature_dim}D)")
+        print(f"✅ Model has {sum(p.numel() for p in self.model.parameters()):,} parameters")
+        print(f"🩸 血管层次结构: {len(self.vessel_hierarchy)} 种血管类型")
         
     def _setup_data(self):
         """设置数据加载器 - 24GB显存优化版本"""
@@ -183,152 +222,351 @@ class VesselTrainer:
         print("✅ Training setup completed")
     
     def train_on_case(self, case_data, epoch, case_idx):
-        """在单个case上训练（分批处理节点）- 适配CPR-TaG-Net，自适应批大小"""
+        """改进的血管感知训练方法 - 充分利用血管连接前置信息"""
         self.model.train()
         
         case_id = case_data['case_id']
+        vessel_ranges = case_data['vessel_node_ranges']
         
         # 准备数据
         node_features = torch.FloatTensor(case_data['node_features']).to(self.device)
         node_positions = torch.FloatTensor(case_data['node_positions']).to(self.device)
         edge_index = torch.LongTensor(case_data['edge_index']).to(self.device)
-        image_cubes = torch.FloatTensor(case_data['image_cubes']).unsqueeze(1).to(self.device)  # [N, 1, 32, 32, 32]
+        image_cubes = torch.FloatTensor(case_data['image_cubes']).to(self.device)
         node_classes = torch.LongTensor(case_data['node_classes']).to(self.device)
-        
-        num_nodes = node_features.shape[0]
-        
-        # 自适应批大小：根据节点数量调整
-        if num_nodes > 5000:
-            batch_size = min(200, num_nodes)  # 大案例用小批
-        elif num_nodes > 2000:
-            batch_size = min(300, num_nodes)  # 中案例用中批
-        else:
-            batch_size = min(self.args.node_batch_size, num_nodes)  # 小案例用大批
-            
-        num_batches = (num_nodes + batch_size - 1) // batch_size
         
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        successful_batches = 0
         
-        # 随机打乱节点顺序
-        indices = torch.randperm(num_nodes, device=self.device)
+        # 🔧 关键改进1: 按血管层次顺序训练
+        vessel_order = self._get_hierarchical_vessel_order(vessel_ranges)
         
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, num_nodes)
-            batch_indices = indices[start_idx:end_idx]
-            
-            # 🔧 改进内存管理：预先清理
-            if batch_idx > 0:
-                torch.cuda.empty_cache()
-            
-            # 批数据准备 - 添加错误检查
-            try:
-                batch_node_features = node_features[batch_indices]
-                batch_node_positions = node_positions[batch_indices]
-                batch_image_cubes = image_cubes[batch_indices]
-                batch_node_classes = node_classes[batch_indices]
-                
-                # 数据完整性检查
-                if batch_node_features.shape[0] == 0:
-                    print(f"⚠️  Empty batch at {batch_idx}, skipping...")
-                    continue
-                    
-                # 检查特征维度
-                if batch_node_features.shape[1] not in [54, 64]:  # 允许的特征维度
-                    print(f"⚠️  Unexpected feature dimension: {batch_node_features.shape}")
-                    
-            except Exception as e:
-                print(f"⚠️  Error preparing batch {batch_idx}: {e}")
+        for vessel_name in vessel_order:
+            if vessel_name not in vessel_ranges:
                 continue
+                
+            start, end = vessel_ranges[vessel_name]
+            vessel_node_indices = torch.arange(start, end + 1, device=self.device)
             
-            # 为CPR-TaG-Net准备边连接 - 这里简化处理，只保留批内连接
-            batch_edge_index = self._prepare_batch_edges(edge_index, batch_indices, batch_size)
+            # 🔧 关键改进2: 血管内批处理，保持连续性
+            vessel_batches = self._create_vessel_batches(vessel_node_indices, max_batch_size=200)
             
-            try:
-                # 前向传播
-                self.optimizer.zero_grad()
-                
-                outputs = self.model(
-                    batch_node_features, 
-                    batch_node_positions, 
-                    batch_edge_index, 
-                    batch_image_cubes
-                )
-                
-                loss = self.criterion(outputs, batch_node_classes)
-                
-                # 反向传播
-                loss.backward()
-                
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                self.optimizer.step()
-                
-                # 统计
-                total_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total_correct += predicted.eq(batch_node_classes).sum().item()
-                total_samples += batch_node_classes.size(0)
-                successful_batches += 1
-                
-                # 记录到日志
-                if batch_idx % 10 == 0:  # 每10个batch记录一次
-                    global_step = epoch * 1000 + batch_idx  # 估算全局步数
-                    self.logger.add_scalar('Train/BatchLoss', loss.item(), global_step)
-                
-                # 清理内存
-                del batch_node_features, batch_node_positions, batch_image_cubes, batch_node_classes, outputs
-                del batch_edge_index
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    # 🔧 改进的OOM处理
+            for batch_idx, batch_indices in enumerate(vessel_batches):
+                try:
+                    # 准备批次数据
+                    batch_node_features = node_features[batch_indices]
+                    batch_node_positions = node_positions[batch_indices]
+                    batch_image_cubes = image_cubes[batch_indices]
+                    batch_node_classes = node_classes[batch_indices]
+                    
+                    # 🔧 关键改进3: 注入血管先验信息
+                    enhanced_features = self._inject_vessel_context(
+                        batch_node_features, vessel_name, batch_indices, vessel_ranges
+                    )
+                    
+                    # 🔧 关键改进4: 获取完整边连接（血管内+血管间）
+                    batch_edge_index = self._get_complete_vessel_edges(
+                        edge_index, batch_indices, vessel_ranges, vessel_name
+                    )
+                    
+                    # 前向传播
+                    self.optimizer.zero_grad()
+                    outputs = self.model(
+                        enhanced_features,
+                        batch_node_positions,
+                        batch_edge_index,
+                        batch_image_cubes
+                    )
+                    
+                    # 🔧 关键改进5: 层次化损失函数
+                    loss = self._compute_hierarchical_loss(
+                        outputs, batch_node_classes, vessel_name, batch_indices
+                    )
+                    
+                    # 反向传播
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    
+                    # 统计
+                    total_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total_correct += predicted.eq(batch_node_classes).sum().item()
+                    total_samples += batch_node_classes.size(0)
+                    
+                    # 记录到日志
+                    if batch_idx % 10 == 0:
+                        global_step = epoch * 1000 + case_idx * 100 + batch_idx
+                        self.logger.add_scalar('Train/BatchLoss', loss.item(), global_step)
+                    
+                    # 内存清理
+                    del enhanced_features, batch_edge_index, outputs
                     torch.cuda.empty_cache()
-                    if batch_size > 32:  # 降低最小批大小阈值
-                        batch_size = max(32, batch_size // 2)
-                        print(f"⚠️  {case_id} OOM, reducing batch size to {batch_size}")
-                        # 强制内存清理
-                        if 'batch_node_features' in locals():
-                            del batch_node_features, batch_node_positions, batch_image_cubes, batch_node_classes
-                        if 'batch_edge_index' in locals():
-                            del batch_edge_index
-                        if 'outputs' in locals():
-                            del outputs
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
                         torch.cuda.empty_cache()
+                        print(f"⚠️  {case_id} OOM in vessel {vessel_name}, skipping batch {batch_idx}")
                         continue
                     else:
-                        print(f"⚠️  {case_id} batch {batch_idx} OOM (min batch size reached), skipping...")
-                        # 跳过当前批次，继续下一个
-                        torch.cuda.empty_cache()
+                        print(f"⚠️  Error in {case_id}, vessel {vessel_name}: {e}")
                         continue
-                elif "size of tensor" in str(e) or "mat1 and mat2 shapes cannot be multiplied" in str(e):
-                    print(f"⚠️  {case_id} tensor dimension mismatch: {e}")
-                    print(f"    Node features: {batch_node_features.shape if 'batch_node_features' in locals() else 'N/A'}")
-                    print(f"    Image cubes: {batch_image_cubes.shape if 'batch_image_cubes' in locals() else 'N/A'}")
-                    # 清理内存并继续
-                    torch.cuda.empty_cache()
-                    continue
-                else:
-                    # 其他错误，重新抛出
-                    print(f"⚠️  Unexpected error in {case_id}: {e}")
-                    raise e
         
-        # 清理case级别的数据
+        # 清理
         del node_features, node_positions, edge_index, image_cubes, node_classes
         torch.cuda.empty_cache()
         
-        avg_loss = total_loss / successful_batches if successful_batches > 0 else 0.0
-        accuracy = 100.0 * total_correct / total_samples if total_samples > 0 else 0.0
+        avg_loss = total_loss / max(1, len(vessel_order))
+        accuracy = 100.0 * total_correct / max(1, total_samples)
         
         return avg_loss, accuracy, total_samples
     
+    def _get_hierarchical_vessel_order(self, vessel_ranges):
+        """获取血管层次训练顺序"""
+        available_vessels = list(vessel_ranges.keys())
+        
+        # 按层次排序：主干 → 分支
+        ordered_vessels = []
+        for level in range(4):  # 0-3级
+            level_vessels = [
+                vessel for vessel in available_vessels 
+                if vessel in self.vessel_hierarchy and 
+                self.vessel_hierarchy[vessel]['level'] == level
+            ]
+            # 同级内按字母排序保证一致性
+            ordered_vessels.extend(sorted(level_vessels))
+        
+        # 添加未在层次中的血管
+        remaining = [v for v in available_vessels if v not in ordered_vessels]
+        ordered_vessels.extend(sorted(remaining))
+        
+        return ordered_vessels
+    
+    def _create_vessel_batches(self, vessel_indices, max_batch_size=200):
+        """创建血管内批次，保持空间连续性"""
+        if len(vessel_indices) <= max_batch_size:
+            return [vessel_indices]
+        
+        # 按空间位置排序，保持连续性
+        batches = []
+        for i in range(0, len(vessel_indices), max_batch_size):
+            end_idx = min(i + max_batch_size, len(vessel_indices))
+            batches.append(vessel_indices[i:end_idx])
+        
+        return batches
+    
+    def _inject_vessel_context(self, node_features, vessel_name, batch_indices, vessel_ranges):
+        """注入血管上下文信息"""
+        batch_size = node_features.shape[0]
+        
+        # 1. 血管类型嵌入
+        vessel_id = self._get_vessel_type_id(vessel_name)
+        vessel_embedding = self.vessel_type_embedding(torch.tensor(vessel_id, device=self.device))
+        vessel_emb_expanded = vessel_embedding.unsqueeze(0).expand(batch_size, -1)
+        
+        # 2. 层次位置编码
+        hierarchy_encoding = self._compute_hierarchy_encoding(vessel_name, batch_size)
+        
+        # 3. 血管内位置编码
+        intra_vessel_encoding = self._compute_intra_vessel_position(
+            batch_indices, vessel_ranges[vessel_name], batch_size
+        )
+        
+        # 4. 特征融合
+        enhanced_features = torch.cat([
+            node_features,
+            vessel_emb_expanded,
+            hierarchy_encoding,
+            intra_vessel_encoding
+        ], dim=1)
+        
+        return enhanced_features
+    
+    def _get_complete_vessel_edges(self, edge_index, batch_indices, vessel_ranges, current_vessel):
+        """获取完整的血管边连接信息"""
+        device = edge_index.device
+        
+        if edge_index.shape[1] == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+        
+        # 1. 批内边（血管内连接）
+        src_in_batch = torch.isin(edge_index[0], batch_indices)
+        dst_in_batch = torch.isin(edge_index[1], batch_indices)
+        intra_batch_mask = src_in_batch & dst_in_batch
+        intra_edges = edge_index[:, intra_batch_mask]
+        
+        # 2. 血管间连接（关键改进！）
+        inter_vessel_edges = self._get_inter_vessel_connections(
+            edge_index, batch_indices, vessel_ranges, current_vessel
+        )
+        
+        # 3. 合并边信息
+        if inter_vessel_edges.shape[1] > 0:
+            all_edges = torch.cat([intra_edges, inter_vessel_edges], dim=1)
+        else:
+            all_edges = intra_edges
+        
+        # 4. 重新索引
+        if all_edges.shape[1] > 0:
+            return self._reindex_edges_for_batch(all_edges, batch_indices)
+        else:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+    
+    def _get_inter_vessel_connections(self, edge_index, batch_indices, vessel_ranges, current_vessel):
+        """获取血管间的关键连接"""
+        device = edge_index.device
+        
+        # 获取当前血管的父血管和子血管
+        parent_vessel = self.vessel_hierarchy.get(current_vessel, {}).get('parent')
+        child_vessels = [
+            v for v, info in self.vessel_hierarchy.items() 
+            if info.get('parent') == current_vessel
+        ]
+        
+        relevant_vessels = []
+        if parent_vessel and parent_vessel in vessel_ranges:
+            relevant_vessels.append(parent_vessel)
+        for child in child_vessels:
+            if child in vessel_ranges:
+                relevant_vessels.append(child)
+        
+        if not relevant_vessels:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+        
+        # 收集相关血管的节点
+        relevant_nodes = []
+        for vessel in relevant_vessels:
+            start, end = vessel_ranges[vessel]
+            relevant_nodes.extend(range(start, end + 1))
+        
+        if not relevant_nodes:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+        
+        relevant_nodes_tensor = torch.tensor(relevant_nodes, device=device)
+        
+        # 找到跨血管的边连接
+        src_in_batch = torch.isin(edge_index[0], batch_indices)
+        dst_in_relevant = torch.isin(edge_index[1], relevant_nodes_tensor)
+        src_in_relevant = torch.isin(edge_index[0], relevant_nodes_tensor)
+        dst_in_batch = torch.isin(edge_index[1], batch_indices)
+        
+        # 双向连接：batch->relevant 或 relevant->batch
+        inter_mask = (src_in_batch & dst_in_relevant) | (src_in_relevant & dst_in_batch)
+        
+        return edge_index[:, inter_mask]
+    
+    def _compute_hierarchical_loss(self, outputs, targets, vessel_name, batch_indices):
+        """计算层次化损失函数"""
+        # 1. 基础交叉熵损失
+        ce_loss = F.cross_entropy(outputs, targets)
+        
+        # 2. 血管类型一致性损失
+        vessel_consistency_loss = self._compute_vessel_consistency_loss(
+            outputs, targets, vessel_name
+        )
+        
+        # 3. 空间连续性损失
+        spatial_consistency_loss = self._compute_spatial_consistency_loss(
+            outputs, batch_indices
+        )
+        
+        # 权重组合
+        total_loss = (ce_loss + 
+                     self.vessel_consistency_weight * vessel_consistency_loss + 
+                     self.spatial_consistency_weight * spatial_consistency_loss)
+        
+        return total_loss
+    
+    def _get_vessel_type_id(self, vessel_name):
+        """获取血管类型ID"""
+        vessel_names = list(self.vessel_hierarchy.keys())
+        if vessel_name in vessel_names:
+            return vessel_names.index(vessel_name)
+        else:
+            return len(vessel_names)  # 未知血管类型
+    
+    def _compute_hierarchy_encoding(self, vessel_name, batch_size):
+        """计算层次位置编码"""
+        if vessel_name in self.vessel_hierarchy:
+            level = self.vessel_hierarchy[vessel_name]['level']
+        else:
+            level = -1  # 未知层次
+        
+        # 简单的位置编码（3级：0-主干，1-左右分支，2-末端分支）
+        encoding = torch.zeros(batch_size, 3, device=self.device)  # 3层
+        if 0 <= level < 3:
+            encoding[:, level] = 1.0
+        
+        return encoding
+    
+    def _compute_intra_vessel_position(self, batch_indices, vessel_range, batch_size):
+        """计算血管内位置编码"""
+        start, end = vessel_range
+        vessel_length = end - start + 1
+        
+        # 归一化位置
+        positions = (batch_indices - start).float() / max(1, vessel_length - 1)
+        position_encoding = positions.unsqueeze(1)  # [batch_size, 1]
+        
+        return position_encoding
+    
+    def _compute_vessel_consistency_loss(self, outputs, targets, vessel_name):
+        """血管类型一致性损失"""
+        if vessel_name not in self.vessel_hierarchy:
+            return torch.tensor(0.0, device=outputs.device)
+        
+        expected_classes = self.vessel_hierarchy[vessel_name]['expected_class_range']
+        
+        # 预测概率
+        probs = F.softmax(outputs, dim=1)
+        
+        # 期望类别的概率和
+        expected_prob = probs[:, expected_classes].sum(dim=1)
+        
+        # 一致性损失：鼓励预测在期望范围内
+        consistency_loss = -torch.log(expected_prob + 1e-8).mean()
+        
+        return consistency_loss
+    
+    def _compute_spatial_consistency_loss(self, outputs, batch_indices):
+        """空间连续性损失（相邻节点预测应该相似）"""
+        if len(batch_indices) < 2:
+            return torch.tensor(0.0, device=outputs.device)
+        
+        # 相邻节点的预测应该相似
+        pred_probs = F.softmax(outputs, dim=1)
+        
+        # 计算相邻预测的差异
+        neighbor_diff = torch.abs(pred_probs[1:] - pred_probs[:-1]).sum(dim=1)
+        
+        # 连续性损失
+        continuity_loss = neighbor_diff.mean()
+        
+        return continuity_loss
+    
+    def _reindex_edges_for_batch(self, edges, batch_indices):
+        """为批次重新索引边"""
+        device = edges.device
+        
+        # 创建索引映射
+        max_idx = max(edges.max().item(), batch_indices.max().item())
+        old_to_new = torch.full((max_idx + 1,), -1, device=device, dtype=torch.long)
+        old_to_new[batch_indices] = torch.arange(len(batch_indices), device=device)
+        
+        # 重新索引
+        new_edges = edges.clone()
+        new_edges[0] = old_to_new[edges[0]]
+        new_edges[1] = old_to_new[edges[1]]
+        
+        # 过滤无效边
+        valid_mask = (new_edges[0] >= 0) & (new_edges[1] >= 0)
+        valid_edges = new_edges[:, valid_mask]
+        
+        return valid_edges
+    
     def _prepare_batch_edges(self, edge_index, batch_indices, batch_size):
-        """为批处理准备边连接 - 改进版本"""
+        """为批处理准备边连接 - 保留原方法作为备用"""
         device = edge_index.device
         
         # 如果没有边，返回空边索引
@@ -420,94 +658,90 @@ class VesselTrainer:
         return avg_loss, avg_acc
     
     def validate_on_case(self, case_data):
-        """在单个case上验证 - 适配CPR-TaG-Net，自适应批大小"""
+        """改进的血管感知验证方法"""
         self.model.eval()
         
         case_id = case_data['case_id']
+        vessel_ranges = case_data['vessel_node_ranges']
         
         with torch.no_grad():
             # 准备数据
             node_features = torch.FloatTensor(case_data['node_features']).to(self.device)
             node_positions = torch.FloatTensor(case_data['node_positions']).to(self.device)
             edge_index = torch.LongTensor(case_data['edge_index']).to(self.device)
-            image_cubes = torch.FloatTensor(case_data['image_cubes']).unsqueeze(1).to(self.device)
+            image_cubes = torch.FloatTensor(case_data['image_cubes']).to(self.device)
             node_classes = torch.LongTensor(case_data['node_classes']).to(self.device)
-            
-            num_nodes = node_features.shape[0]
-            
-            # 自适应批大小
-            if num_nodes > 5000:
-                batch_size = min(200, num_nodes)
-            elif num_nodes > 2000:
-                batch_size = min(300, num_nodes)
-            else:
-                batch_size = min(self.args.node_batch_size, num_nodes)
-                
-            num_batches = (num_nodes + batch_size - 1) // batch_size
             
             total_loss = 0.0
             total_correct = 0
             total_samples = 0
-            successful_batches = 0
             
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, num_nodes)
+            # 🔧 验证时也使用血管感知的方法
+            vessel_order = self._get_hierarchical_vessel_order(vessel_ranges)
+            
+            for vessel_name in vessel_order:
+                if vessel_name not in vessel_ranges:
+                    continue
+                    
+                start, end = vessel_ranges[vessel_name]
+                vessel_node_indices = torch.arange(start, end + 1, device=self.device)
                 
-                # 批数据
-                batch_indices = torch.arange(start_idx, end_idx, device=self.device)
-                batch_node_features = node_features[batch_indices]
-                batch_node_positions = node_positions[batch_indices]
-                batch_image_cubes = image_cubes[batch_indices]
-                batch_node_classes = node_classes[batch_indices]
+                vessel_batches = self._create_vessel_batches(vessel_node_indices, max_batch_size=300)
                 
-                # 为CPR-TaG-Net准备边连接
-                batch_edge_index = self._prepare_batch_edges(edge_index, batch_indices, batch_size)
-                
-                try:
-                    outputs = self.model(
-                        batch_node_features, 
-                        batch_node_positions, 
-                        batch_edge_index, 
-                        batch_image_cubes
-                    )
-                    
-                    loss = self.criterion(outputs, batch_node_classes)
-                    
-                    # 统计
-                    total_loss += loss.item()
-                    _, predicted = outputs.max(1)
-                    total_correct += predicted.eq(batch_node_classes).sum().item()
-                    total_samples += batch_node_classes.size(0)
-                    successful_batches += 1
-                    
-                    # 清理内存
-                    del batch_node_features, batch_node_positions, batch_image_cubes, batch_node_classes, outputs
-                    del batch_edge_index
-                    torch.cuda.empty_cache()
-                    
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
+                for batch_idx, batch_indices in enumerate(vessel_batches):
+                    try:
+                        # 准备批次数据
+                        batch_node_features = node_features[batch_indices]
+                        batch_node_positions = node_positions[batch_indices]
+                        batch_image_cubes = image_cubes[batch_indices]
+                        batch_node_classes = node_classes[batch_indices]
+                        
+                        # 注入血管上下文信息
+                        enhanced_features = self._inject_vessel_context(
+                            batch_node_features, vessel_name, batch_indices, vessel_ranges
+                        )
+                        
+                        # 获取完整边连接
+                        batch_edge_index = self._get_complete_vessel_edges(
+                            edge_index, batch_indices, vessel_ranges, vessel_name
+                        )
+                        
+                        # 前向传播
+                        outputs = self.model(
+                            enhanced_features,
+                            batch_node_positions,
+                            batch_edge_index,
+                            batch_image_cubes
+                        )
+                        
+                        # 计算损失（验证时只用基础损失）
+                        loss = F.cross_entropy(outputs, batch_node_classes)
+                        
+                        # 统计
+                        total_loss += loss.item()
+                        _, predicted = outputs.max(1)
+                        total_correct += predicted.eq(batch_node_classes).sum().item()
+                        total_samples += batch_node_classes.size(0)
+                        
+                        # 清理内存
+                        del enhanced_features, batch_edge_index, outputs
                         torch.cuda.empty_cache()
-                        if batch_size > 50:
-                            batch_size = batch_size // 2
-                            print(f"⚠️  Validation {case_id} OOM, reducing batch size to {batch_size}")
+                        
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            torch.cuda.empty_cache()
+                            print(f"⚠️  Validation {case_id} OOM in vessel {vessel_name}, skipping batch {batch_idx}")
                             continue
                         else:
-                            print(f"⚠️  Validation {case_id} batch {batch_idx} OOM, skipping...")
+                            print(f"⚠️  Validation error in {case_id}, vessel {vessel_name}: {e}")
                             continue
-                    elif "size of tensor" in str(e):
-                        print(f"⚠️  Validation {case_id} tensor dimension mismatch: {e}")
-                        continue
-                    else:
-                        raise e
             
-            # 清理case级别的数据
+            # 清理
             del node_features, node_positions, edge_index, image_cubes, node_classes
             torch.cuda.empty_cache()
             
-            avg_loss = total_loss / successful_batches if successful_batches > 0 else 0.0
-            accuracy = 100.0 * total_correct / total_samples if total_samples > 0 else 0.0
+            avg_loss = total_loss / max(1, len(vessel_order))
+            accuracy = 100.0 * total_correct / max(1, total_samples)
             
             return avg_loss, accuracy, total_samples
 
@@ -573,7 +807,7 @@ class VesselTrainer:
                     node_features = torch.tensor(case_data['node_features'], dtype=torch.float32).to(self.device)
                     node_positions = torch.tensor(case_data['node_positions'], dtype=torch.float32).to(self.device)
                     edge_index = torch.tensor(case_data['edge_index'], dtype=torch.long).to(self.device)
-                    image_cubes = torch.tensor(case_data['image_cubes'], dtype=torch.float32).unsqueeze(1).to(self.device)  # [N, 1, 32, 32, 32]
+                    image_cubes = torch.tensor(case_data['image_cubes'], dtype=torch.float32).to(self.device)  # [N, 32, 32, 32]
                     labels = torch.tensor(case_data['node_classes'], dtype=torch.long).to(self.device)
                     
                     # 模型预测 - 使用CPR-TaG-Net的完整参数
@@ -738,15 +972,15 @@ class VesselTrainer:
             if epoch % self.args.save_freq == 0 or is_best or epoch == self.args.epochs - 1:
                 self.save_checkpoint(epoch, train_loss, val_loss, val_acc, is_best)
                 
-                # 增强功能：在最佳模型时生成混淆矩阵
-                if is_best and self.enhanced_trainer and self.args.save_confusion_matrix:
-                    try:
-                        print("   📊 生成最佳模型混淆矩阵...")
-                        self.logger.log_message("生成最佳模型混淆矩阵")
-                        self._generate_confusion_matrix(epoch + 1)
-                    except Exception as e:
-                        print(f"   ⚠️ 混淆矩阵生成失败: {e}")
-                        self.logger.log_message(f"混淆矩阵生成失败: {e}", "WARNING")
+                # # 增强功能：在最佳模型时生成混淆矩阵
+                # if is_best and self.enhanced_trainer and self.args.save_confusion_matrix:
+                #     try:
+                #         print("   📊 生成最佳模型混淆矩阵...")
+                #         self.logger.log_message("生成最佳模型混淆矩阵")
+                #         self._generate_confusion_matrix(epoch + 1)
+                #     except Exception as e:
+                #         print(f"   ⚠️ 混淆矩阵生成失败: {e}")
+                #         self.logger.log_message(f"混淆矩阵生成失败: {e}", "WARNING")
         
         # 计算总训练时间
         total_time = (time.time() - self.start_time) / 60  # 转换为分钟
@@ -817,10 +1051,19 @@ def main():
     parser.add_argument('--visualization_dir', type=str, default='/home/lihe/classify/lungmap/outputs/visualizations',
                        help='可视化结果保存目录')
     
+    # 🔧 血管感知训练参数
+    parser.add_argument('--enable_vessel_aware', action='store_true', default=True,
+                       help='启用血管感知训练（推荐）')
+    parser.add_argument('--vessel_consistency_weight', type=float, default=0.1,
+                       help='血管一致性损失权重')
+    parser.add_argument('--spatial_consistency_weight', type=float, default=0.05,
+                       help='空间连续性损失权重')
+    
     args = parser.parse_args()
     
     # 打印配置
     print("🔧 CPR-TaG-Net Training Configuration:")
+    print("🧠 血管感知训练改进版 - 充分利用血管连接前置信息")
     print(f"  Data directory: {args.data_dir}")
     if args.enable_large_cases:
         print(f"  24GB显存模式: 启用大案例训练")
@@ -831,6 +1074,18 @@ def main():
     print(f"  Node batch size: {args.node_batch_size}")
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    
+    # 🔧 血管感知训练配置
+    if args.enable_vessel_aware:
+        print(f"  🩸 血管感知训练: 启用")
+        print(f"    - 血管层次顺序训练")
+        print(f"    - 血管间连接保持")
+        print(f"    - 血管先验信息注入")
+        print(f"    - 层次化损失函数")
+        print(f"    - 血管一致性权重: {args.vessel_consistency_weight}")
+        print(f"    - 空间连续性权重: {args.spatial_consistency_weight}")
+    else:
+        print(f"  ⚠️  血管感知训练: 禁用（不推荐）")
     
     # 增强功能配置
     enhanced_features = []

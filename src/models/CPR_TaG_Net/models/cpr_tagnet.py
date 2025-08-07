@@ -49,6 +49,9 @@ class CPRTaGNet(nn.Module):
         
         # ===== 图像条件路径 =====
         try:
+            # 为4D图像数据添加通道维度 [N, 32, 32, 32] -> [N, 1, 32, 32, 32]
+            if image_cubes.dim() == 4:
+                image_cubes = image_cubes.unsqueeze(1)
             image_feat = self.image_encoder(image_cubes)  # [N, 64]
             image_cond = self.image_proj(image_feat)  # [N, 256]
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
@@ -104,8 +107,8 @@ class CPRTaGNet(nn.Module):
         if edge_index.dim() != 2 or edge_index.shape[0] != 2:
             raise ValueError(f"edge_index维度错误: 期望 [2, E], 实际 {edge_index.shape}")
         
-        if image_cubes.dim() != 5:
-            raise ValueError(f"image_cubes维度错误: 期望 [N, C, D, H, W], 实际 {image_cubes.shape}")
+        if image_cubes.dim() not in [4, 5]:
+            raise ValueError(f"image_cubes维度错误: 期望 [N, D, H, W] 或 [N, C, D, H, W], 实际 {image_cubes.shape}")
         
         if image_cubes.shape[0] != x_node.shape[0]:
             raise ValueError(f"图像块数量不匹配: image_cubes {image_cubes.shape[0]}, x_node {x_node.shape[0]}")

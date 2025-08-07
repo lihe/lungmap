@@ -3,7 +3,7 @@
 
 model:
   name: CPRTaGNet
-  num_classes: 18
+  num_classes: 15
   image_condition_channels: 1
   node_feature_dim: 54
   tps_sample_num: 64
@@ -56,18 +56,15 @@ vessel_classes:
   - "MPA"      # 0: 主肺动脉
   - "LPA"      # 1: 左肺动脉  
   - "RPA"      # 2: 右肺动脉
-  - "Linternal" # 3: 左肺动脉内侧段
-  - "Lupper"   # 4: 左上叶动脉
-  - "Lmedium"  # 5: 左中叶动脉
-  - "Ldown"    # 6: 左下叶动脉
-  - "L1+2"     # 7: 左上叶前段+后段
-  - "L1+3"     # 8: 左上叶前段+尖段
-  - "Rinternal" # 9: 右肺动脉内侧段
-  - "Rupper"   # 10: 右上叶动脉
-  - "Rmedium"  # 11: 右中叶动脉
-  - "RDown"    # 12: 右下叶动脉
-  - "R1+2"     # 13: 右上叶前段+后段
-  - "R1+3"     # 14: 右上叶前段+尖段
-  - "R4"       # 15: 右中叶外侧段
-  - "R5"       # 16: 右中叶内侧段
-  - "other"    # 17: 其他
+  - "Lupper"   # 3: 左上叶动脉
+  - "Rupper"   # 4: 右上叶动脉
+  - "L1+2"     # 5: 左上叶前段+后段
+  - "R1+2"     # 6: 右上叶前段+后段
+  - "L1+3"     # 7: 左上叶前段+尖段
+  - "R1+3"     # 8: 右上叶前段+尖段
+  - "Linternal" # 9: 左肺动脉内侧段
+  - "Rinternal" # 10: 右肺动脉内侧段
+  - "Lmedium"  # 11: 左中叶动脉
+  - "Rmedium"  # 12: 右中叶动脉
+  - "Ldown"    # 13: 左下叶动脉
+  - "RDown"    # 14: 右下叶动脉

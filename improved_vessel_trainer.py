@@ -17,17 +17,30 @@ class ImprovedVesselTrainer:
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 血管层次映射
+        # 血管层次映射 - 修正为15类3层结构
         self.vessel_hierarchy = {
-            'MPA': {'level': 0, 'parent': None, 'expected_class_range': [0, 1, 2]},
-            'RPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [3, 4, 5]},
-            'LPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [3, 4, 5]},
-            'Rinternal': {'level': 2, 'parent': 'RPA', 'expected_class_range': [6, 7, 8]},
-            'Linternal': {'level': 2, 'parent': 'LPA', 'expected_class_range': [6, 7, 8]},
-            'RDown': {'level': 3, 'parent': 'Rinternal', 'expected_class_range': [9, 10, 11, 12]},
-            'Ldown': {'level': 3, 'parent': 'Linternal', 'expected_class_range': [9, 10, 11, 12]},
-            'RUpper': {'level': 3, 'parent': 'Rinternal', 'expected_class_range': [13, 14, 15]},
-            'Lupper': {'level': 3, 'parent': 'Linternal', 'expected_class_range': [13, 14, 15]}
+            # 一级：主肺动脉
+            'MPA': {'level': 0, 'parent': None, 'expected_class_range': [0]},
+            
+            # 二级：左右肺动脉
+            'LPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1]},
+            'RPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [2]},
+            
+            # 三级：左侧分支
+            'Lupper': {'level': 2, 'parent': 'LPA', 'expected_class_range': [3]},
+            'L1+2': {'level': 2, 'parent': 'LPA', 'expected_class_range': [5]},
+            'L1+3': {'level': 2, 'parent': 'LPA', 'expected_class_range': [7]},
+            'Linternal': {'level': 2, 'parent': 'LPA', 'expected_class_range': [9]},
+            'Lmedium': {'level': 2, 'parent': 'LPA', 'expected_class_range': [11]},
+            'Ldown': {'level': 2, 'parent': 'LPA', 'expected_class_range': [13]},
+            
+            # 三级：右侧分支
+            'Rupper': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4]},
+            'R1+2': {'level': 2, 'parent': 'RPA', 'expected_class_range': [6]},
+            'R1+3': {'level': 2, 'parent': 'RPA', 'expected_class_range': [8]},
+            'Rinternal': {'level': 2, 'parent': 'RPA', 'expected_class_range': [10]},
+            'Rmedium': {'level': 2, 'parent': 'RPA', 'expected_class_range': [12]},
+            'RDown': {'level': 2, 'parent': 'RPA', 'expected_class_range': [14]}
         }
         
         # 血管类型嵌入

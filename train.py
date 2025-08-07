@@ -60,28 +60,30 @@ class VesselTrainer:
         }
         self.logger.log_config(config_dict)
         
-        # 🔧 血管感知训练改进：添加正确的血管层次信息（包括变异情况）
+        # 🔧 血管感知训练改进：正确的血管层次信息（15类3级结构）
         self.vessel_hierarchy = {
             # 一级：主肺动脉
-            'MPA': {'level': 0, 'parent': None, 'expected_class_range': [0, 1, 2, 3]},
+            'MPA': {'level': 0, 'parent': None, 'expected_class_range': [0]},
             
             # 二级：左右肺动脉
-            'LPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1, 2, 3]},
-            'RPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1, 2, 3]},
+            'LPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [1]},
+            'RPA': {'level': 1, 'parent': 'MPA', 'expected_class_range': [2]},
             
-            # 三级：上叶、段间、内侧、中叶、下叶分支（包括变异）
-            'Lupper': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},
-            'Rupper': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},
-            'L1+2': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},      # 左上叶变异
-            'R1+2': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},      # 右上叶变异
-            'L1+3': {'level': 2, 'parent': 'LPA', 'expected_class_range': [4, 5, 6, 7]},      # 左上叶变异
-            'R1+3': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4, 5, 6, 7]},      # 右上叶变异
-            'Linternal': {'level': 2, 'parent': 'LPA', 'expected_class_range': [8, 9, 10, 11]},
-            'Rinternal': {'level': 2, 'parent': 'RPA', 'expected_class_range': [8, 9, 10, 11]},
-            'Lmedium': {'level': 2, 'parent': 'LPA', 'expected_class_range': [12]},         # 左中叶（变异）
-            'Rmedium': {'level': 2, 'parent': 'RPA', 'expected_class_range': [12]},         # 右中叶
-            'Ldown': {'level': 2, 'parent': 'LPA', 'expected_class_range': [13, 14]},
-            'RDown': {'level': 2, 'parent': 'RPA', 'expected_class_range': [13, 14]}
+            # 三级：左侧分支
+            'Lupper': {'level': 2, 'parent': 'LPA', 'expected_class_range': [3]},
+            'L1+2': {'level': 2, 'parent': 'LPA', 'expected_class_range': [5]},        # 左上叶变异
+            'L1+3': {'level': 2, 'parent': 'LPA', 'expected_class_range': [7]},        # 左上叶变异  
+            'Linternal': {'level': 2, 'parent': 'LPA', 'expected_class_range': [9]},
+            'Lmedium': {'level': 2, 'parent': 'LPA', 'expected_class_range': [11]},    # 左中叶（变异）
+            'Ldown': {'level': 2, 'parent': 'LPA', 'expected_class_range': [13]},
+            
+            # 三级：右侧分支
+            'Rupper': {'level': 2, 'parent': 'RPA', 'expected_class_range': [4]},
+            'R1+2': {'level': 2, 'parent': 'RPA', 'expected_class_range': [6]},        # 右上叶变异
+            'R1+3': {'level': 2, 'parent': 'RPA', 'expected_class_range': [8]},        # 右上叶变异
+            'Rinternal': {'level': 2, 'parent': 'RPA', 'expected_class_range': [10]},
+            'Rmedium': {'level': 2, 'parent': 'RPA', 'expected_class_range': [12]},    # 右中叶
+            'RDown': {'level': 2, 'parent': 'RPA', 'expected_class_range': [14]}
         }
         
         # 血管类型嵌入（更新维度以适应更多血管类型）
@@ -328,7 +330,7 @@ class VesselTrainer:
         
         # 按层次排序：主干 → 分支
         ordered_vessels = []
-        for level in range(4):  # 0-3级
+        for level in range(3):  # 0-2级（修正为15类3层结构）
             level_vessels = [
                 vessel for vessel in available_vessels 
                 if vessel in self.vessel_hierarchy and 

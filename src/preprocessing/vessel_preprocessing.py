@@ -27,26 +27,27 @@ class VesselPreprocessor:
         self.spacing = spacing
         self.cube_size = cube_size
         
-        # 血管层次结构 - 对应CPR-TaG-Net的18个类别
+        # 血管层次结构 - 与train.py保持一致，15个血管类型
         self.vessel_hierarchy = {
-            'main': ['MPA'],  # 主肺动脉 - 类别0
-            'primary': ['LPA', 'RPA'],  # 左右肺动脉 - 类别1,2
-            'secondary_left': ['Linternal', 'Lupper', 'Lmedium', 'Ldown'],  # 左侧二级 - 类别3-6
-            'secondary_right': ['Rinternal', 'Rupper', 'Rmedium', 'RDown'],  # 右侧二级 - 类别7-10
-            'tertiary_left': ['L1+2', 'L1+3'],  # 左侧三级 - 类别11-12
-            'tertiary_right': ['R1+2', 'R1+3'],  # 右侧三级 - 类别13-14
-            'background': ['background'],  # 背景 - 类别15
-            'uncertain': ['uncertain'],  # 不确定 - 类别16
-            'junction': ['junction']  # 连接点 - 类别17
+            'MPA': 0,        # 主肺动脉
+            'LPA': 1,        # 左肺动脉
+            'RPA': 2,        # 右肺动脉
+            'Lupper': 3,     # 左上叶
+            'Rupper': 4,     # 右上叶
+            'L1+2': 5,       # 左上叶变异
+            'R1+2': 6,       # 右上叶变异
+            'L1+3': 7,       # 左上叶变异
+            'R1+3': 8,       # 右上叶变异
+            'Linternal': 9,  # 左段间
+            'Rinternal': 10, # 右段间
+            'Lmedium': 11,   # 左中叶
+            'Rmedium': 12,   # 右中叶
+            'Ldown': 13,     # 左下叶
+            'RDown': 14      # 右下叶
         }
         
         # 创建标签到类别的映射
-        self.label_to_class = {}
-        class_id = 0
-        for level, vessels in self.vessel_hierarchy.items():
-            for vessel in vessels:
-                self.label_to_class[vessel] = class_id
-                class_id += 1
+        self.label_to_class = self.vessel_hierarchy.copy()
         
         os.makedirs(output_dir, exist_ok=True)
     
@@ -947,11 +948,8 @@ class VesselPreprocessor:
             for i in range(start_node_id, end_node_id):
                 all_edges.append([i, i + 1])
         
-        # 🔧 修复：基于解剖学知识强制连接血管
-        anatomical_connections = [
-            ('MPA', 'LPA'), ('MPA', 'RPA'),
-            ('LPA', 'Linternal'), ('RPA', 'Rinternal')
-        ]
+        # 🔧 修复：基于解剖学知识强制连接血管 - 使用完整的连接关系
+        anatomical_connections = self._get_anatomical_connections()
         
         for vessel1, vessel2 in anatomical_connections:
             if vessel1 in vessel_node_ranges and vessel2 in vessel_node_ranges:
@@ -1015,27 +1013,27 @@ class VesselPreprocessor:
         return best_connection if best_distance < 50.0 else None
     
     def _get_anatomical_connections(self) -> List[Tuple[str, str]]:
-        """获取解剖学连接关系"""
+        """获取解剖学连接关系 - 按照正确的血管层次结构"""
         connections = [
-            # 主要连接
+            # 一级到二级连接
             ('MPA', 'LPA'),
             ('MPA', 'RPA'),
             
-            # 左侧连接
-            ('LPA', 'Linternal'),
+            # 二级到三级连接 - 左侧
             ('LPA', 'Lupper'),
-            ('Linternal', 'Lmedium'),
-            ('Linternal', 'Ldown'),
-            ('Lupper', 'L1+2'),
-            ('Lupper', 'L1+3'),
+            ('LPA', 'L1+2'),
+            ('LPA', 'L1+3'),
+            ('LPA', 'Linternal'),
+            ('LPA', 'Lmedium'),
+            ('LPA', 'Ldown'),
             
-            # 右侧连接
-            ('RPA', 'Rinternal'),
+            # 二级到三级连接 - 右侧
             ('RPA', 'Rupper'),
-            ('Rinternal', 'Rmedium'),
-            ('Rinternal', 'RDown'),
-            ('Rupper', 'R1+2'),
-            ('Rupper', 'R1+3'),
+            ('RPA', 'R1+2'),
+            ('RPA', 'R1+3'),
+            ('RPA', 'Rinternal'),
+            ('RPA', 'Rmedium'),
+            ('RPA', 'RDown'),
         ]
         return connections
     
@@ -1260,15 +1258,14 @@ class VesselPreprocessor:
         if class1 == class2 and distance < 3.0:
             return True
         
-        # 🔧 修复：正确的解剖学邻接关系
+        # 🔧 修复：正确的解剖学邻接关系 - 3级血管层次结构
         anatomical_adjacency = {
-            0: [1, 2],        # MPA -> LPA, RPA
-            1: [3, 4, 5, 6],  # LPA -> Linternal, Lupper, Lmedium, Ldown
-            2: [7, 8, 9, 10], # RPA -> Rinternal, Rupper, Rmedium, RDown
-            3: [11, 12],      # Linternal -> L1+2, L1+3 (可能的连接)
-            4: [11, 12],      # Lupper -> L1+2, L1+3
-            7: [13, 14],      # Rinternal -> R1+2, R1+3 (可能的连接)
-            8: [13, 14],      # Rupper -> R1+2, R1+3
+            # 一级血管 MPA
+            0: [1, 2],                    # MPA -> LPA, RPA
+            
+            # 二级血管 LPA, RPA  
+            1: [3, 5, 7, 9, 11, 13],     # LPA -> Lupper, L1+2, L1+3, Linternal, Lmedium, Ldown
+            2: [4, 6, 8, 10, 12, 14],    # RPA -> Rupper, R1+2, R1+3, Rinternal, Rmedium, RDown
         }
         
         # 检查解剖学邻接关系 (双向)
@@ -1283,15 +1280,18 @@ class VesselPreprocessor:
         """基于解剖学先验知识的连接补全"""
         new_edges = []
         
-        # 定义解剖学连接规则
+        # 定义解剖学连接规则 - 按照正确的血管层次结构
         anatomical_connections = [
+            # 一级到二级连接
             ('MPA', 'LPA'), ('MPA', 'RPA'),
-            ('LPA', 'Linternal'), ('LPA', 'Lupper'),
-            ('RPA', 'Rinternal'), ('RPA', 'Rupper'),
-            ('Linternal', 'Lmedium'), ('Linternal', 'Ldown'),
-            ('Lupper', 'L1+2'), ('Lupper', 'L1+3'),
-            ('Rinternal', 'Rmedium'), ('Rinternal', 'RDown'),
-            ('Rupper', 'R1+2'), ('Rupper', 'R1+3'),
+            
+            # 二级到三级连接 - 左侧
+            ('LPA', 'Lupper'), ('LPA', 'L1+2'), ('LPA', 'L1+3'),
+            ('LPA', 'Linternal'), ('LPA', 'Lmedium'), ('LPA', 'Ldown'),
+            
+            # 二级到三级连接 - 右侧
+            ('RPA', 'Rupper'), ('RPA', 'R1+2'), ('RPA', 'R1+3'),
+            ('RPA', 'Rinternal'), ('RPA', 'Rmedium'), ('RPA', 'RDown'),
         ]
         
         # 为每个解剖学连接找到最佳节点对
@@ -1503,15 +1503,14 @@ class VesselPreprocessor:
         if classes[src] == classes[tgt]:
             return True
         
-        # 2. 检查解剖学兼容性
+        # 2. 检查解剖学兼容性 - 3级血管层次结构
         anatomical_adjacency = {
-            0: [1, 2],        # MPA -> LPA, RPA
-            1: [3, 4, 5, 6],  # LPA -> Linternal, Lupper, Lmedium, Ldown
-            2: [7, 8, 9, 10], # RPA -> Rinternal, Rupper, Rmedium, RDown
-            3: [11, 12],      # Linternal -> L1+2, L1+3
-            4: [11, 12],      # Lupper -> L1+2, L1+3
-            7: [13, 14],      # Rinternal -> R1+2, R1+3
-            8: [13, 14],      # Rupper -> R1+2, R1+3
+            # 一级血管 MPA
+            0: [1, 2],                    # MPA -> LPA, RPA
+            
+            # 二级血管 LPA, RPA  
+            1: [3, 5, 7, 9, 11, 13],     # LPA -> Lupper, L1+2, L1+3, Linternal, Lmedium, Ldown
+            2: [4, 6, 8, 10, 12, 14],    # RPA -> Rupper, R1+2, R1+3, Rinternal, Rmedium, RDown
         }
         
         # 检查解剖学邻接关系 (双向)

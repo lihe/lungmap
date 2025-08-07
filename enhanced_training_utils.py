@@ -33,12 +33,15 @@ class EnhancedTrainingUtils:
         print(f"   可视化保存目录: {self.save_dir}")
         
     def _get_default_vessel_classes(self):
-        """获取默认的18类血管分类"""
+        """获取默认的15类血管分类"""
         return {
-            'MPA': 0, 'LPA': 1, 'RPA': 2, 'Linternal': 3, 'Lupper': 4,
-            'Rinternal': 5, 'Rupper': 6, 'Lmedium': 7, 'Ldown': 8,
-            'L1+2': 9, 'L1+3': 10, 'Rmedium': 11, 'RDown': 12,
-            'R1+2': 13, 'R1+3': 14, 'R4': 15, 'R5': 16, 'other': 17
+            'MPA': 0, 'LPA': 1, 'RPA': 2,
+            'Lupper': 3, 'Rupper': 4,
+            'L1+2': 5, 'R1+2': 6,
+            'L1+3': 7, 'R1+3': 8,
+            'Linternal': 9, 'Rinternal': 10,
+            'Lmedium': 11, 'Rmedium': 12,
+            'Ldown': 13, 'RDown': 14
         }
         
     def complete_graph(self, centerline_pos, predicted_labels, distance_threshold=5.0):
@@ -102,16 +105,11 @@ class EnhancedTrainingUtils:
     
     def _should_connect(self, label_i, label_j):
         """判断两个标签的血管段是否应该连接"""
-        # 血管解剖连接规则 - 基于肺血管树结构
+        # 血管解剖连接规则 - 基于15类肺血管树结构
         anatomical_connections = {
             0: [1, 2],      # MPA -> LPA, RPA
-            1: [3, 4],      # LPA -> Linternal, Lupper
-            2: [5, 6],      # RPA -> Rinternal, Rupper
-            3: [7, 8],      # Linternal -> Lmedium, Ldown
-            4: [9, 10],     # Lupper -> L1+2, L1+3
-            5: [11, 12],    # Rinternal -> Rmedium, RDown
-            6: [13, 14],    # Rupper -> R1+2, R1+3
-            11: [15, 16],   # Rmedium -> R4, R5
+            1: [3, 5, 7, 9, 11, 13],    # LPA -> Lupper, L1+2, L1+3, Linternal, Lmedium, Ldown
+            2: [4, 6, 8, 10, 12, 14],   # RPA -> Rupper, R1+2, R1+3, Rinternal, Rmedium, RDown
         }
         
         # 相同标签可以连接

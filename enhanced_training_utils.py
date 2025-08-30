@@ -190,7 +190,7 @@ class EnhancedTrainingUtils:
         plt.xlabel("Predicted Label", fontsize=14, fontweight='bold')
         plt.ylabel("True Label", fontsize=14, fontweight='bold')
         
-        title = "CPR-TaG-Net 血管分类混淆矩阵"
+        title = "CPR-TaG-Net Vessel Classification Confusion Matrix"
         if epoch is not None:
             title += f" (Epoch {epoch})"
         plt.title(title, fontsize=16, fontweight='bold', pad=20)
@@ -316,49 +316,49 @@ class EnhancedTrainingUtils:
         epochs = range(1, len(train_losses) + 1)
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('CPR-TaG-Net 训练进度监控', fontsize=16, fontweight='bold')
+        fig.suptitle('CPR-TaG-Net Training Progress Monitor', fontsize=16, fontweight='bold')
         
-        # 训练损失
+        # Training Loss
         axes[0, 0].plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2, marker='o', markersize=3)
         if val_losses:
             val_epochs = range(1, len(val_losses) + 1)
             axes[0, 0].plot(val_epochs, val_losses, 'r--', label='Validation Loss', linewidth=2, marker='s', markersize=3)
         axes[0, 0].set_xlabel('Epoch')
         axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].set_title('训练损失曲线')
+        axes[0, 0].set_title('Training Loss Curve')
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
         
-        # 训练准确率
+        # Training Accuracy
         axes[0, 1].plot(epochs, train_accs, 'g-', label='Training Accuracy', linewidth=2, marker='o', markersize=3)
         if val_accs:
             val_epochs = range(1, len(val_accs) + 1)
             axes[0, 1].plot(val_epochs, val_accs, 'r--', label='Validation Accuracy', linewidth=2, marker='s', markersize=3)
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Accuracy')
-        axes[0, 1].set_title('训练准确率曲线')
+        axes[0, 1].set_title('Training Accuracy Curve')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
         axes[0, 1].set_ylim(0, 1)
         
-        # 损失变化率
+        # Loss Change Rate
         if len(train_losses) > 1:
             loss_changes = np.diff(train_losses)
             axes[1, 0].plot(epochs[1:], loss_changes, 'purple', linewidth=2, marker='o', markersize=3)
             axes[1, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
             axes[1, 0].set_xlabel('Epoch')
             axes[1, 0].set_ylabel('Loss Change')
-            axes[1, 0].set_title('损失变化率')
+            axes[1, 0].set_title('Loss Change Rate')
             axes[1, 0].grid(True, alpha=0.3)
         
-        # 准确率变化率
+        # Accuracy Change Rate
         if len(train_accs) > 1:
             acc_changes = np.diff(train_accs)
             axes[1, 1].plot(epochs[1:], acc_changes, 'orange', linewidth=2, marker='o', markersize=3)
             axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
             axes[1, 1].set_xlabel('Epoch')
             axes[1, 1].set_ylabel('Accuracy Change')
-            axes[1, 1].set_title('准确率变化率')
+            axes[1, 1].set_title('Accuracy Change Rate')
             axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -377,23 +377,23 @@ class EnhancedTrainingUtils:
         report_path = self.save_dir / report_name
         
         with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("CPR-TaG-Net 预测质量分析报告\n")
+            f.write("CPR-TaG-Net Prediction Quality Analysis Report\n")
             f.write("=" * 50 + "\n\n")
-            f.write(f"总样本数: {analysis['total_samples']}\n")
-            f.write(f"总体准确率: {analysis['overall_accuracy']:.4f}\n\n")
+            f.write(f"Total Samples: {analysis['total_samples']}\n")
+            f.write(f"Overall Accuracy: {analysis['overall_accuracy']:.4f}\n\n")
             
-            f.write("各类别准确率:\n")
+            f.write("Class-wise Accuracy:\n")
             for class_name, acc in analysis['class_accuracy'].items():
                 support = analysis['class_support'][class_name]
-                f.write(f"  {class_name}: {acc:.4f} (支持度: {support})\n")
+                f.write(f"  {class_name}: {acc:.4f} (Support: {support})\n")
             
-            f.write(f"\n困难类别 (准确率 < 0.5):\n")
+            f.write(f"\nDifficult Classes (Accuracy < 0.5):\n")
             for class_name, acc in analysis['difficult_classes']:
                 f.write(f"  {class_name}: {acc:.4f}\n")
             
-            f.write(f"\n主要错误模式:\n")
+            f.write(f"\nMain Error Patterns:\n")
             for pattern, count in analysis['error_patterns'].items():
-                f.write(f"  {pattern}: {count} 次\n")
+                f.write(f"  {pattern}: {count} times\n")
         
         print(f"   💾 分析报告已保存: {report_path}")
 

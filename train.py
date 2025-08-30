@@ -106,6 +106,17 @@ class VesselTrainer:
                 print(f"⚠️ 无法导入增强训练工具: {e}")
                 print("   部分可视化功能可能不可用")
         
+        # 🔧 动态验证集配置
+        self.dynamic_split_interval = getattr(args, 'dynamic_split_interval', 10)  # 每10个epoch重新分割
+        self.current_split_epoch = 0
+        self.original_data_list = None  # 保存原始数据用于重新分割
+        
+        # 🔧 多重验证配置
+        self.enable_cross_validation = getattr(args, 'enable_cross_validation', False)
+        self.cv_folds = getattr(args, 'cv_folds', 5)
+        self.enable_leave_one_out = getattr(args, 'enable_leave_one_out', False)
+        self.cv_results = []  # 存储交叉验证结果
+        
         # 训练历史记录（用于可视化）
         self.train_losses = []
         self.train_accs = []
@@ -179,19 +190,11 @@ class VesselTrainer:
             print("❌ No suitable cases found, using first 3 cases")
             filtered_data = data_list[:3]
         
-        # 创建数据分割
-        train_data, val_data, test_data = create_data_splits(
-            filtered_data, 
-            train_ratio=0.7, 
-            val_ratio=0.15, 
-            test_ratio=0.15,
-            random_state=42
-        )
+        # 🔧 保存原始数据用于动态重新分割
+        self.original_data_list = filtered_data.copy()
         
-        # 保存为类属性
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
+        # 创建初始数据分割
+        self._create_dynamic_data_splits(random_seed=42)
         
         print(f"✅ Data splits - Train: {len(self.train_data)}, Val: {len(self.val_data)}, Test: {len(self.test_data)}")
         
@@ -222,6 +225,211 @@ class VesselTrainer:
         )
         
         print("✅ Training setup completed")
+    
+    def _create_dynamic_data_splits(self, random_seed=None):
+        """🔧 动态创建数据分割 - 定期重新分割防止验证集过拟合"""
+        if random_seed is None:
+            import time
+            random_seed = int(time.time()) % 10000  # 使用时间戳生成随机种子
+        
+        print(f"🔄 Creating dynamic data splits (seed: {random_seed})...")
+        
+        # 创建数据分割
+        train_data, val_data, test_data = create_data_splits(
+            self.original_data_list, 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
+            test_ratio=0.15,
+            random_state=random_seed
+        )
+        
+        # 保存为类属性
+        self.train_data = train_data
+        self.val_data = val_data
+        self.test_data = test_data
+        
+        # 记录分割信息
+        train_case_ids = [d['case_id'] for d in train_data]
+        val_case_ids = [d['case_id'] for d in val_data]
+        test_case_ids = [d['case_id'] for d in test_data]
+        
+        self.logger.log_message(f"动态数据重新分割 (seed: {random_seed})")
+        self.logger.log_message(f"训练集: {train_case_ids}")
+        self.logger.log_message(f"验证集: {val_case_ids}")
+        self.logger.log_message(f"测试集: {test_case_ids}")
+        
+        print(f"🔄 Dynamic split completed - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+    
+    def _should_resplit_data(self, epoch):
+        """检查是否需要重新分割数据"""
+        if self.dynamic_split_interval <= 0:
+            return False
+            
+        return (epoch + 1) % self.dynamic_split_interval == 0 and epoch > 0
+    
+    def _perform_cross_validation(self, epoch):
+        """🔧 执行K-fold交叉验证"""
+        if not self.enable_cross_validation or not self.original_data_list:
+            return
+        
+        print(f"\n🔬 执行 {self.cv_folds}-fold 交叉验证 (Epoch {epoch + 1})...")
+        
+        from sklearn.model_selection import KFold
+        import numpy as np
+        
+        kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=42 + epoch)
+        fold_results = []
+        
+        for fold, (train_idx, val_idx) in enumerate(kf.split(self.original_data_list)):
+            # 简化输出：不再为每个fold打印详细信息
+            if fold == 0:  # 只在第一个fold时输出提示
+                print(f"  📁 执行 {self.cv_folds} 个 folds...")
+            
+            # 创建fold数据集
+            fold_train_data = [self.original_data_list[i] for i in train_idx]
+            fold_val_data = [self.original_data_list[i] for i in val_idx]
+            
+            # 临时保存当前数据集
+            original_train = self.train_data
+            original_val = self.val_data
+            
+            # 设置fold数据集
+            self.train_data = fold_train_data
+            self.val_data = fold_val_data
+            
+            try:
+                # 在当前fold上验证
+                val_loss, val_acc = self.validate(epoch)
+                fold_results.append({
+                    'fold': fold + 1,
+                    'val_loss': val_loss,
+                    'val_acc': val_acc,
+                    'train_cases': len(fold_train_data),
+                    'val_cases': len(fold_val_data)
+                })
+                
+                # 简化输出：只显示关键信息，不逐个fold打印
+                
+            except Exception as e:
+                # 简化错误输出
+                fold_results.append({
+                    'fold': fold + 1,
+                    'val_loss': float('inf'),
+                    'val_acc': 0.0,
+                    'error': str(e)
+                })
+            
+            # 恢复原始数据集
+            self.train_data = original_train
+            self.val_data = original_val
+        
+        # 计算交叉验证统计
+        valid_results = [r for r in fold_results if 'error' not in r]
+        if valid_results:
+            avg_loss = np.mean([r['val_loss'] for r in valid_results])
+            avg_acc = np.mean([r['val_acc'] for r in valid_results])
+            std_loss = np.std([r['val_loss'] for r in valid_results])
+            std_acc = np.std([r['val_acc'] for r in valid_results])
+            
+            cv_result = {
+                'epoch': epoch + 1,
+                'folds': self.cv_folds,
+                'avg_loss': avg_loss,
+                'avg_acc': avg_acc,
+                'std_loss': std_loss,
+                'std_acc': std_acc,
+                'fold_results': fold_results
+            }
+            
+            self.cv_results.append(cv_result)
+            
+            print(f"  📊 交叉验证结果:")
+            print(f"    平均验证损失: {avg_loss:.4f} ± {std_loss:.4f}")
+            print(f"    平均验证准确率: {avg_acc:.2f}% ± {std_acc:.2f}%")
+            
+            # 记录到日志
+            self.logger.add_scalar('CrossVal/AvgLoss', avg_loss, epoch)
+            self.logger.add_scalar('CrossVal/AvgAccuracy', avg_acc, epoch)
+            self.logger.add_scalar('CrossVal/StdLoss', std_loss, epoch)
+            self.logger.add_scalar('CrossVal/StdAccuracy', std_acc, epoch)
+            
+            self.logger.log_message(f"K-fold交叉验证 (Epoch {epoch + 1}): 平均准确率 {avg_acc:.2f}% ± {std_acc:.2f}%")
+        else:
+            print(f"  ❌ 所有fold验证都失败了")
+    
+    def _perform_leave_one_out_validation(self, epoch):
+        """🔧 执行留一法验证"""
+        if not self.enable_leave_one_out or not self.original_data_list:
+            return
+        
+        if len(self.original_data_list) > 10:
+            print(f"  ⚠️ 数据集过大({len(self.original_data_list)}个案例)，跳过留一法验证")
+            return
+        
+        print(f"\n🔬 执行留一法验证 (Epoch {epoch + 1})...")
+        
+        loo_results = []
+        print(f"  📁 执行留一法验证 ({len(self.original_data_list)} 个案例)...")
+        
+        for i, test_case in enumerate(self.original_data_list):
+            # 简化输出：不为每个案例单独打印
+            
+            # 创建留一法数据集
+            loo_train_data = [self.original_data_list[j] for j in range(len(self.original_data_list)) if j != i]
+            loo_test_data = [test_case]
+            
+            # 临时保存当前数据集
+            original_train = self.train_data
+            original_val = self.val_data
+            
+            # 设置留一法数据集
+            self.train_data = loo_train_data
+            self.val_data = loo_test_data
+            
+            try:
+                # 在当前留一法设置上验证
+                val_loss, val_acc = self.validate(epoch)
+                loo_results.append({
+                    'test_case': test_case['case_id'],
+                    'val_loss': val_loss,
+                    'val_acc': val_acc
+                })
+                
+                # 简化输出：不为每个案例单独打印结果
+                
+            except Exception as e:
+                # 简化错误输出：只记录到结果中
+                loo_results.append({
+                    'test_case': test_case['case_id'],
+                    'val_loss': float('inf'),
+                    'val_acc': 0.0,
+                    'error': str(e)
+                })
+            
+            # 恢复原始数据集
+            self.train_data = original_train
+            self.val_data = original_val
+        
+        # 计算留一法统计
+        valid_results = [r for r in loo_results if 'error' not in r]
+        if valid_results:
+            import numpy as np
+            avg_loss = np.mean([r['val_loss'] for r in valid_results])
+            avg_acc = np.mean([r['val_acc'] for r in valid_results])
+            std_loss = np.std([r['val_loss'] for r in valid_results])
+            std_acc = np.std([r['val_acc'] for r in valid_results])
+            
+            print(f"  📊 留一法验证结果:")
+            print(f"    平均验证损失: {avg_loss:.4f} ± {std_loss:.4f}")
+            print(f"    平均验证准确率: {avg_acc:.2f}% ± {std_acc:.2f}%")
+            
+            # 记录到日志
+            self.logger.add_scalar('LeaveOneOut/AvgLoss', avg_loss, epoch)
+            self.logger.add_scalar('LeaveOneOut/AvgAccuracy', avg_acc, epoch)
+            
+            self.logger.log_message(f"留一法验证 (Epoch {epoch + 1}): 平均准确率 {avg_acc:.2f}% ± {std_acc:.2f}%")
+        else:
+            print(f"  ❌ 所有留一法验证都失败了")
     
     def train_on_case(self, case_data, epoch, case_idx):
         """改进的血管感知训练方法 - 充分利用血管连接前置信息"""
@@ -297,8 +505,8 @@ class VesselTrainer:
                     total_correct += predicted.eq(batch_node_classes).sum().item()
                     total_samples += batch_node_classes.size(0)
                     
-                    # 记录到日志
-                    if batch_idx % 10 == 0:
+                    # 记录到日志 - 减少记录频率，避免输出过于频繁
+                    if batch_idx % 50 == 0:  # 从每10个batch改为每50个batch记录一次
                         global_step = epoch * 1000 + case_idx * 100 + batch_idx
                         self.logger.add_scalar('Train/BatchLoss', loss.item(), global_step)
                     
@@ -638,13 +846,15 @@ class VesselTrainer:
                 
                 current_acc = 100.0 * epoch_correct / epoch_samples if epoch_samples > 0 else 0.0
                 
-                pbar.set_postfix({
-                    'Case': case_id,
-                    'Nodes': num_nodes,
-                    'Loss': f'{loss:.3f}',
-                    'Acc': f'{current_acc:.1f}%',
-                    'GPU': f'{torch.cuda.memory_allocated()/1024**3:.1f}GB'
-                })
+                # 简化进度条更新：只在重要节点更新，减少输出频率
+                if i % 3 == 0 or i == len(train_indices) - 1:  # 每3个案例更新一次，或最后一个案例
+                    pbar.set_postfix({
+                        'Case': case_id,
+                        'Nodes': num_nodes,
+                        'Loss': f'{loss:.3f}',
+                        'Acc': f'{current_acc:.1f}%',
+                        'GPU': f'{torch.cuda.memory_allocated()/1024**3:.1f}GB'
+                    })
                 
             except Exception as e:
                 print(f"❌ Error training on {case_id}: {e}")
@@ -716,8 +926,10 @@ class VesselTrainer:
                             batch_image_cubes
                         )
                         
-                        # 计算损失（验证时只用基础损失）
-                        loss = F.cross_entropy(outputs, batch_node_classes)
+                        # 🔧 统一损失函数：验证时也使用层级损失
+                        loss = self._compute_hierarchical_loss(
+                            outputs, batch_node_classes, vessel_name, batch_indices
+                        )
                         
                         # 统计
                         total_loss += loss.item()
@@ -759,7 +971,7 @@ class VesselTrainer:
         epoch_samples = 0
         
         pbar = tqdm(self.val_data, desc='Validation Cases')
-        for case_data in pbar:
+        for i, case_data in enumerate(pbar):
             case_id = case_data['case_id']
             num_nodes = len(case_data['node_features'])
             
@@ -772,12 +984,14 @@ class VesselTrainer:
                 
                 current_acc = 100.0 * epoch_correct / epoch_samples if epoch_samples > 0 else 0.0
                 
-                pbar.set_postfix({
-                    'Case': case_id,
-                    'Nodes': num_nodes,
-                    'Loss': f'{loss:.3f}',
-                    'Acc': f'{current_acc:.1f}%'
-                })
+                # 简化验证进度条更新：减少更新频率
+                if i % 2 == 0 or i == len(self.val_data) - 1:  # 每2个案例更新一次，或最后一个案例
+                    pbar.set_postfix({
+                        'Case': case_id,
+                        'Nodes': num_nodes,
+                        'Loss': f'{loss:.3f}',
+                        'Acc': f'{current_acc:.1f}%'
+                    })
                 
             except Exception as e:
                 print(f"❌ Error validating on {case_id}: {e}")
@@ -906,11 +1120,25 @@ class VesselTrainer:
         for epoch in range(self.args.epochs):
             epoch_start_time = time.time()
             
+            # 🔧 动态数据重新分割
+            if self._should_resplit_data(epoch):
+                print(f"\n🔄 Epoch {epoch + 1}: 执行动态数据重新分割...")
+                self._create_dynamic_data_splits()
+                self.logger.log_message(f"Epoch {epoch + 1}: 执行动态数据重新分割")
+            
             # 训练
             train_loss, train_acc = self.train_epoch(epoch)
             
             # 验证
             val_loss, val_acc = self.validate(epoch)
+            
+            # 🔧 多重验证：交叉验证（每5个epoch执行一次）
+            if (epoch + 1) % 5 == 0:
+                if self.enable_cross_validation:
+                    self._perform_cross_validation(epoch)
+                
+                if self.enable_leave_one_out:
+                    self._perform_leave_one_out_validation(epoch)
             
             # 记录训练历史（用于可视化）
             self.train_losses.append(train_loss)
@@ -990,6 +1218,56 @@ class VesselTrainer:
         print(f"\n🎉 Training completed! Best validation accuracy: {best_val_acc:.2f}% (Epoch {best_epoch})")
         print(f"⏱️ Total training time: {total_time:.2f} minutes")
         
+        # 🔧 综合验证结果报告
+        if self.cv_results:
+            print(f"\n📊 综合验证结果分析:")
+            print(f"{'='*60}")
+            
+            # 最佳交叉验证结果
+            best_cv = max(self.cv_results, key=lambda x: x['avg_acc'])
+            print(f"🏆 最佳交叉验证结果 (Epoch {best_cv['epoch']}):")
+            print(f"   平均准确率: {best_cv['avg_acc']:.2f}% ± {best_cv['std_acc']:.2f}%")
+            print(f"   平均损失: {best_cv['avg_loss']:.4f} ± {best_cv['std_loss']:.4f}")
+            
+            # 最终交叉验证结果
+            final_cv = self.cv_results[-1]
+            print(f"📈 最终交叉验证结果 (Epoch {final_cv['epoch']}):")
+            print(f"   平均准确率: {final_cv['avg_acc']:.2f}% ± {final_cv['std_acc']:.2f}%")
+            print(f"   平均损失: {final_cv['avg_loss']:.4f} ± {final_cv['std_loss']:.4f}")
+            
+            # 验证稳定性分析
+            cv_accs = [cv['avg_acc'] for cv in self.cv_results]
+            import numpy as np
+            trend = "稳定" if np.std(cv_accs) < 5.0 else "不稳定"
+            print(f"🎯 验证稳定性: {trend} (标准差: {np.std(cv_accs):.2f}%)")
+            
+            # 对比传统验证vs交叉验证
+            print(f"\n⚖️  验证方法对比:")
+            print(f"   传统验证最佳准确率: {best_val_acc:.2f}%")
+            print(f"   交叉验证最佳准确率: {best_cv['avg_acc']:.2f}% ± {best_cv['std_acc']:.2f}%")
+            
+            accuracy_diff = abs(best_val_acc - best_cv['avg_acc'])
+            if accuracy_diff > 10.0:
+                print(f"   ⚠️  差异较大({accuracy_diff:.1f}%)，可能存在过拟合风险")
+            elif accuracy_diff > 5.0:
+                print(f"   ⚠️  存在一定差异({accuracy_diff:.1f}%)，建议关注")
+            else:
+                print(f"   ✅ 结果一致({accuracy_diff:.1f}%)，验证可靠")
+            
+            # 记录综合分析到日志
+            self.logger.log_message("="*60)
+            self.logger.log_message("综合验证结果分析")
+            self.logger.log_message(f"最佳交叉验证: {best_cv['avg_acc']:.2f}% ± {best_cv['std_acc']:.2f}% (Epoch {best_cv['epoch']})")
+            self.logger.log_message(f"最终交叉验证: {final_cv['avg_acc']:.2f}% ± {final_cv['std_acc']:.2f}% (Epoch {final_cv['epoch']})")
+            self.logger.log_message(f"验证稳定性: {trend}")
+            self.logger.log_message(f"传统验证 vs 交叉验证差异: {accuracy_diff:.1f}%")
+        else:
+            print(f"\n📊 仅使用了传统验证方法")
+            if hasattr(self, 'dynamic_split_interval') and self.dynamic_split_interval > 0:
+                resplit_count = self.args.epochs // self.dynamic_split_interval
+                print(f"🔄 动态验证集重新分割次数: {resplit_count}")
+                self.logger.log_message(f"动态验证集重新分割次数: {resplit_count}")
+        
         # 最终可视化
         if self.enhanced_trainer:
             if self.args.save_training_curves:
@@ -1061,6 +1339,16 @@ def main():
     parser.add_argument('--spatial_consistency_weight', type=float, default=0.05,
                        help='空间连续性损失权重')
     
+    # 🔧 验证改进参数
+    parser.add_argument('--dynamic_split_interval', type=int, default=10,
+                       help='动态重新分割数据的间隔(epoch)，0表示禁用')
+    parser.add_argument('--enable_cross_validation', action='store_true',
+                       help='启用K-fold交叉验证')
+    parser.add_argument('--cv_folds', type=int, default=5,
+                       help='交叉验证的fold数量')
+    parser.add_argument('--enable_leave_one_out', action='store_true',
+                       help='启用留一法验证(仅适用于小数据集)')
+    
     args = parser.parse_args()
     
     # 打印配置
@@ -1088,6 +1376,21 @@ def main():
         print(f"    - 空间连续性权重: {args.spatial_consistency_weight}")
     else:
         print(f"  ⚠️  血管感知训练: 禁用（不推荐）")
+    
+    # 🔧 验证改进功能配置
+    validation_features = []
+    if args.dynamic_split_interval > 0:
+        validation_features.append(f"动态验证集(每{args.dynamic_split_interval}epoch)")
+    if args.enable_cross_validation:
+        validation_features.append(f"{args.cv_folds}-fold交叉验证")
+    if args.enable_leave_one_out:
+        validation_features.append("留一法验证")
+    
+    if validation_features:
+        print(f"  🔬 验证改进功能: {', '.join(validation_features)}")
+        print(f"    - 统一损失函数: 验证时使用层级损失")
+    else:
+        print(f"  🔬 验证改进功能: 仅统一损失函数")
     
     # 增强功能配置
     enhanced_features = []

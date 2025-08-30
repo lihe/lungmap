@@ -112,8 +112,13 @@ class TxtLogger:
         elif 'LearningRate' in tag:
             self.metrics['learning_rate'].append((step, value))
         
-        # 记录到训练日志
-        self.log_message(f"{category}/{metric}: {value:.6f} (Step: {step})")
+        # 记录到训练日志 - 只写入文件，不输出到终端
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [METRIC] {category}/{metric}: {value:.6f} (Step: {step})\n"
+        
+        # 写入训练日志
+        with open(self.train_log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
     
     def log_epoch_summary(self, epoch, train_loss, train_acc, val_loss, val_acc, lr, extra_info=None):
         """记录每个epoch的汇总信息"""

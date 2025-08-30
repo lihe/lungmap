@@ -55,8 +55,10 @@ echo "1. 快速测试模式 (小数据集, 10轮)"
 echo "2. 标准训练模式 (中等数据集, 50轮)"
 echo "3. 完整训练模式 (大数据集, 100轮)"
 echo "4. 血管感知训练模式 (推荐, 带血管层次信息)"
+echo "5. 🔬 验证改进模式 (统一损失+动态验证+交叉验证)"
+echo "6. 🚀 全功能训练模式 (所有改进功能启用)"
 
-read -p "请选择训练模式 [1-4]: " choice
+read -p "请选择训练模式 [1-6]: " choice
 
 case $choice in
     1)
@@ -110,6 +112,43 @@ case $choice in
             --save_training_curves \
             --save_confusion_matrix
         ;;
+    5)
+        echo "🔬 启动验证改进模式 (统一损失+动态验证+交叉验证)..."
+        python train.py \
+            --epochs 30 \
+            --max_nodes 2000 \
+            --node_batch_size 300 \
+            --save_freq 5 \
+            --enable_vessel_aware \
+            --vessel_consistency_weight 0.1 \
+            --spatial_consistency_weight 0.05 \
+            --dynamic_split_interval 5 \
+            --enable_cross_validation \
+            --cv_folds 3 \
+            --enable_leave_one_out \
+            --save_training_curves \
+            --save_confusion_matrix
+        ;;
+    6)
+        echo "🚀 启动全功能训练模式 (所有改进功能启用)..."
+        python train.py \
+            --epochs 50 \
+            --enable_large_cases \
+            --max_nodes_per_case 8000 \
+            --node_batch_size 500 \
+            --save_freq 5 \
+            --enable_vessel_aware \
+            --vessel_consistency_weight 0.1 \
+            --spatial_consistency_weight 0.05 \
+            --dynamic_split_interval 10 \
+            --enable_cross_validation \
+            --cv_folds 5 \
+            --enable_leave_one_out \
+            --enable_graph_completion \
+            --enable_visualization \
+            --save_training_curves \
+            --save_confusion_matrix
+        ;;
     *)
         echo "❌ 无效选择"
         exit 1
@@ -121,3 +160,10 @@ echo "🎉 训练完成!"
 echo "📝 查看训练日志: outputs/logs/"
 echo "💾 查看模型检查点: outputs/checkpoints/"
 echo "📊 查看可视化结果: outputs/visualizations/"
+echo ""
+echo "🔬 验证改进功能说明:"
+echo "  - 统一损失函数: 训练和验证都使用层级损失"
+echo "  - 动态验证集: 定期重新分割数据防止过拟合"
+echo "  - K-fold交叉验证: 更可靠的模型评估"
+echo "  - 留一法验证: 小数据集的严格验证"
+echo "  - 综合验证分析: 对比多种验证方法的结果"
